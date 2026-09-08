@@ -641,7 +641,7 @@ describe("translation", () => {
     expect((await res.json()).comments[0].translated).toBe("fresh");
   });
 
-  it("flags a failing comment instead of failing the whole fetch, and stops trying", async () => {
+  it("flags a failing comment instead of failing the whole fetch", async () => {
     const e = env();
     let n = 0;
     e.AI = {
@@ -661,8 +661,13 @@ describe("translation", () => {
     // The page still renders — the whole point of catching per comment.
     expect(body.comments).toHaveLength(3);
     expect(body.comments.every((c: any) => c.translationFailed)).toBe(true);
-    // …and the remaining subrequests are not spent rediscovering the same failure.
-    expect(n).toBe(1);
+    // ⚠️ **Three, not one.** This asserted `1` while the calls were sequential and
+    // stopped at the first failure. They now run TOGETHER, so an exhausted allowance is
+    // discovered once per comment — three wasted subrequests out of a per-request cap
+    // that is not otherwise spent, traded for the reason the loop was unwound: at ~1.95s
+    // per call, a page of twenty foreign comments took ~40s serially and now takes one
+    // round trip. See the doc on `translate` in comments.ts.
+    expect(n).toBe(3);
   });
 
   it("flags everything untranslated when there is no AI binding at all", async () => {

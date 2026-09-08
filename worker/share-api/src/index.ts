@@ -112,7 +112,9 @@ import {
   handleGetReplies,
   handleGetComments,
   handleGetFriendComments,
+  handleGetTranslations,
   loadNativeArchiveReplies,
+  translateArchiveRows,
   handlePostComment,
   handleReactToComment,
   handleReportComment,
@@ -762,6 +764,20 @@ export default {
 
     if (p === "/api/comments" && req.method === "POST") return handlePostComment(req, env, ctx, notifyComment);
 
+    /**
+     * "Did the slow translations land yet?" — a cache-only read, polled by the sheet a
+     * couple of seconds after it opens so a comment the deadline gave up on fills itself
+     * in without a refresh.
+     *
+     * ⚠️ Registered BEFORE `commentTarget` below. That pattern is uppercase-only
+     * (`[0-9A-Z:]`) so "translations" cannot match it today — but the two would collide
+     * the moment anyone relaxed the id alphabet, and the failure would be a 404 on a
+     * route that exists.
+     */
+    if (p === "/api/comments/translations" && req.method === "GET") {
+      return handleGetTranslations(req, env, ctx);
+    }
+
     const commentTarget = p.match(/^\/api\/comments\/([0-9A-Z:]{8,80})$/);
     if (commentTarget && req.method === "DELETE") return handleDeleteComment(commentTarget[1], req, env, ctx);
 
@@ -795,17 +811,18 @@ export default {
        * ⚠️ Loaded even when the archive half returns null. Upstream being down must
        * not hide a reply that lives in our own database.
        */
+      const lang = (url.searchParams.get("lang") ?? "").slice(0, 8);
       const [page, native] = await Promise.all([
         loadArchiveReplies(env as any, archiveReplies[1], session.userId, url.searchParams.get("cursor")),
-        loadNativeArchiveReplies(
-          env as any,
-          archiveReplies[1],
-          (url.searchParams.get("lang") ?? "").slice(0, 8),
-          ctx,
-        ).catch(() => []),
+        loadNativeArchiveReplies(env as any, archiveReplies[1], lang, ctx).catch(() => []),
       ]);
       return json({
         ...(page ?? { comments: [], cursor: null, complete: true }),
+        // ⚠️ Both halves of the thread translate, and they must: a reader who can read
+        // the partner's top-level comment because we translated it, then expands and
+        // finds its replies in the original language, has been handed half a
+        // conversation. `native` already came back translated from the call above.
+        comments: page ? await translateArchiveRows(env as any, page.comments, lang, ctx) : [],
         native,
       });
     }

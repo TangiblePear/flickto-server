@@ -13,3 +13,12 @@ dist/
 # before it is pushed to R2 by hand. Never committed -- it is generated, dated, and the
 # answer half must not sit in a repo alongside the puzzle it answers.
 worker/daily-ai/regen/
+
+# Daily-game payloads pulled down for inspection, beside the worker that serves them:
+# `latest.json` is the obfuscated puzzle, `recent.json` the tmdbId window, and
+# `answer-YYYY-MM-DD.json` is the plaintext ANSWER. Same reasoning as `worker/daily-ai/regen/`
+# above — generated, dated, and the answer half must not sit in a repo alongside the puzzle it
+# answers.
+worker/share-api/latest.json
+worker/share-api/recent.json
+worker/share-api/answer-*.json

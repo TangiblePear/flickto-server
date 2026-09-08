@@ -38,7 +38,7 @@ import { isPremiere, visibleBorderId, visiblePictureUrl } from "./premiere";
 import { appVersion } from "./profiles";
 import { evaluateAppCheck, logAppCheck, type AppCheckEnv } from "./appcheck";
 import { recordAdminAction } from "./adminAudit";
-import { loadArchivePage } from "./commsuniComments";
+import { ARCHIVE_PAGE_LIMIT, loadArchivePage } from "./commsuniComments";
 import { drainArchiveOutbox, queueMirror, queueUnmirror } from "./commsuniMirror";
 import { resolveReference, refPath } from "./commsuniEntities";
 
@@ -649,13 +649,15 @@ export async function loadReactionCounts(
 const TRANSLATION_MODEL = "@cf/meta/m2m100-1.2b";
 
 /**
- * ⚠️ Bounds the AI calls one request can make. **Subrequests are the constraint**
- * — 50 per invocation on the free plan — and the budget is roughly: session +
- * friendships + comments ~3, translation cache lookup 1, one AI call per
- * untranslated comment up to 20, batched writeback 1. About 25. A 50-comment page
- * would blow the limit outright, which is why [PAGE_LIMIT] is 20.
+ * How long a response will WAIT on translation before shipping without it.
+ *
+ * ⚠️ Sized from measurement, not taste: one m2m100 call is ~1.95s wall on Workers AI
+ * (House of the Dragon, 2026-09-08). Since the calls now run together, a page needs one
+ * round trip rather than one per comment — so this is "a bit less than one call", which
+ * lets a fast call through and refuses to let a slow one hold the sheet. Raising it past
+ * ~2s buys a few more first-view translations at the cost of the thing being fixed.
  */
-const MAX_TRANSLATIONS_PER_REQUEST = PAGE_LIMIT;
+const TRANSLATION_DEADLINE_MS = 1_500;
 
 /** m2m100 wants a bare language code; our locales carry regions (`pt-BR`, `pt-PT`). */
 const baseLang = (tag: string) => tag.split(/[-_]/)[0].toLowerCase();
@@ -668,86 +670,377 @@ interface Translated {
 }
 
 /**
- * Translate [rows] into [target], reading the cache first and writing new results
- * back in one batch.
+ * The one shape the translator understands, so a native row and a partner's row reach
+ * it the same way.
  *
- * **Top-down, and it STOPS at the first failure.** If the allowance runs out
- * mid-page, the comments at the top — the ones actually being read — are the
- * translated ones, and the remaining twenty subrequests are not spent discovering
- * the same failure nineteen more times. That is what "ordered degradation" buys.
+ * [version] is what makes a cached translation safe to reuse: it must change whenever
+ * the source text does, or a stale translation stays cached forever while readers see
+ * text that no longer matches the original. Native rows have `updated_at`; archive rows
+ * carry no `updatedAt` at all and hash their body instead.
  */
+interface Translatable {
+  id: string;
+  body: string;
+  lang: string | null;
+  version: number;
+}
+
+/**
+ * Where translations for one kind of comment live.
+ *
+ * ⚠️ Two tables, one engine — see migration 0056 for why partner translations are not
+ * simply extra rows in `comment_translations`. The engine below is identical for both;
+ * only the cache differs, and the difference is a retention boundary rather than a
+ * schema one.
+ */
+interface TranslationStore {
+  /** Cached translations for [ids] in [target]. One indexed batch read, never per id. */
+  read(
+    env: CommentsEnv,
+    ids: string[],
+    target: string,
+  ): Promise<Map<string, { text: string; version: number }>>;
+  /** A statement writing one result back. Batched by the engine, never run alone. */
+  write(
+    env: CommentsEnv,
+    id: string,
+    target: string,
+    text: string,
+    version: number,
+  ): D1PreparedStatement;
+  /**
+   * Bounds the AI calls one page may spend.
+   *
+   * ⚠️ **Subrequests are the constraint** — 50 per invocation on the free plan — and
+   * it is always the PAGE LIMIT of whatever this store serves, because one call per
+   * comment is the worst case and a page can never be longer than its own limit. The
+   * native budget is roughly: session + friendships + comments ~3, cache lookup 1, one
+   * AI call per untranslated comment up to 20, batched writeback 1. About 25. The
+   * archive budget is the friends path's ~13 (session, friendships, the two comment
+   * queries, reaction counts, my reactions, and the eight the archive read itself
+   * spends) plus the same 22, which is why [ARCHIVE_PAGE_LIMIT] is also 20 and why a
+   * 50-comment page would blow the limit outright.
+   */
+  limit: number;
+}
+
+const nativeTranslations: TranslationStore = {
+  async read(env, ids, target) {
+    const placeholders = ids.map(() => "?").join(",");
+    const { results } = await env.DB.prepare(
+      `SELECT comment_id, text, src_updated_at FROM comment_translations
+        WHERE lang = ? AND comment_id IN (${placeholders})`,
+    )
+      .bind(target, ...ids)
+      .all<{ comment_id: string; text: string; src_updated_at: number }>();
+    return new Map(
+      (results ?? []).map((r) => [r.comment_id, { text: r.text, version: r.src_updated_at }]),
+    );
+  },
+  write(env, id, target, text, version) {
+    return env.DB.prepare(
+      `INSERT INTO comment_translations (comment_id, lang, text, src_updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(comment_id, lang) DO UPDATE
+         SET text = excluded.text, src_updated_at = excluded.src_updated_at`,
+    ).bind(id, target, text, version);
+  },
+  limit: PAGE_LIMIT,
+};
+
+const archiveTranslations: TranslationStore = {
+  async read(env, ids, target) {
+    const placeholders = ids.map(() => "?").join(",");
+    const { results } = await env.DB.prepare(
+      `SELECT archive_id, text, src_hash FROM archive_translations
+        WHERE lang = ? AND archive_id IN (${placeholders})`,
+    )
+      .bind(target, ...ids)
+      .all<{ archive_id: string; text: string; src_hash: number }>();
+    return new Map(
+      (results ?? []).map((r) => [r.archive_id, { text: r.text, version: r.src_hash }]),
+    );
+  },
+  write(env, id, target, text, version) {
+    return env.DB.prepare(
+      `INSERT INTO archive_translations (archive_id, lang, text, src_hash, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(archive_id, lang) DO UPDATE
+         SET text = excluded.text, src_hash = excluded.src_hash, created_at = excluded.created_at`,
+    ).bind(id, target, text, version, Date.now());
+  },
+  limit: ARCHIVE_PAGE_LIMIT,
+};
+
+/**
+ * FNV-1a 32, over the source text.
+ *
+ * Stands in for the `updated_at` an archive row does not have. Synchronous on purpose:
+ * `crypto.subtle.digest` is async and would turn a pure function into something every
+ * caller has to await, for a stronger guarantee than cache invalidation needs.
+ */
+export function srcHash(text: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+/**
+ * Translate [items] into [target], reading [store] first and writing new results back
+ * in one batch.
+ *
+ * **Concurrent, and bounded by a deadline rather than by a count.**
+ *
+ * ⚠️ This was a sequential loop, and the loop was the whole latency bug. Measured on
+ * House of the Dragon, 2026-09-08: one `env.AI.run` costs ~1.95s wall (6ms CPU — it is
+ * pure inference wait), so a page needing two translations took 4.2s and a page of
+ * twenty foreign comments — a Brazilian or Turkish title, i.e. exactly what this
+ * feature exists for — would have taken ~40s and died. Firing them together makes the
+ * page cost ONE model round trip instead of one per comment, and costs nothing extra
+ * against the subrequest cap: it is still one call per comment either way.
+ *
+ * ⚠️ **The old "stop at the first failure" degradation is deliberately gone.** It
+ * existed so an exhausted allowance was discovered once rather than twenty times, which
+ * is only possible while the calls are ordered. Concurrency trades those wasted
+ * subrequests for the 40s cliff above — the right way round, because subrequests are
+ * capped per request and cost nothing when unused, while a 40s response is a broken
+ * screen.
+ *
+ * ⚠️ **The deadline never cancels the work, it only stops WAITING for it.** Whatever
+ * has not landed in [TRANSLATION_DEADLINE_MS] is reported `failed` to this reader — the
+ * established cue meaning "we could not, try on-device" — while the call keeps running
+ * under `waitUntil` and still writes to the cache. So the slow first reader pays a
+ * bounded wait and everyone after them, including that same reader on a refresh, gets a
+ * cache hit. Without this the deadline would be pure loss: a wait AND no cached result.
+ */
+async function translate(
+  env: CommentsEnv,
+  items: Translatable[],
+  target: string,
+  store: TranslationStore,
+  ctx?: ExecutionContext,
+): Promise<Record<string, Translated>> {
+  const out: Record<string, Translated> = {};
+  const needed = items.filter(
+    (r) => r.body !== "" && r.lang != null && baseLang(r.lang) !== baseLang(target),
+  );
+  if (needed.length === 0) return out;
+
+  const cached = await store.read(env, needed.map((r) => r.id), target);
+
+  const misses: Translatable[] = [];
+  for (const row of needed) {
+    const hit = cached.get(row.id);
+    // The version check is what makes editing safe: a stale translation would
+    // otherwise stay cached forever while readers see text that no longer
+    // matches the original.
+    if (hit && hit.version === row.version) out[row.id] = { text: hit.text, failed: false };
+    else misses.push(row);
+  }
+  if (misses.length === 0) return out;
+
+  // No binding is the same answer as an exhausted allowance, and always has been: one
+  // code path, two causes.
+  if (!env.AI) {
+    for (const row of misses) out[row.id] = { text: null, failed: true };
+    return out;
+  }
+
+  // Anything past the cap is not attempted at all. Flagged, so the client can offer
+  // on-device rather than silently showing text the reader cannot read.
+  for (const row of misses.slice(store.limit)) out[row.id] = { text: null, failed: true };
+  const budget = misses.slice(0, store.limit);
+
+  /** Filled as calls land, read at the deadline AND again when the last one finishes. */
+  const done = new Map<string, string | null>();
+  const jobs = Promise.all(
+    budget.map(async (row) => {
+      try {
+        const result = (await env.AI!.run(TRANSLATION_MODEL, {
+          text: row.body,
+          source_lang: baseLang(row.lang!),
+          target_lang: baseLang(target),
+        })) as { translated_text?: string } | null;
+        const text = result?.translated_text ?? "";
+        // Per comment, never per fetch. One model hiccup must not empty the page.
+        done.set(row.id, text || null);
+      } catch {
+        done.set(row.id, null);
+      }
+    }),
+  );
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    jobs.then(() => clearTimeout(timer)),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, TRANSLATION_DEADLINE_MS);
+    }),
+  ]);
+
+  for (const row of budget) {
+    // ⚠️ `has`, not a truthy check. A finished-but-failed call stores null and must read
+    // as failed; a call still in flight is absent and reads as failed for THIS reader
+    // only — it is still running, and its result still reaches the cache below.
+    const text = done.has(row.id) ? done.get(row.id)! : null;
+    out[row.id] = { text, failed: text === null };
+  }
+
+  /**
+   * Write back everything that eventually succeeded, late arrivals included.
+   *
+   * Batched, because each write would otherwise be its own subrequest against the same
+   * 50-per-invocation budget the AI calls are already spending — and hung off `jobs`
+   * rather than the deadline so a call that missed the response still warms the cache.
+   */
+  const flush = jobs.then(() => {
+    const writes = budget
+      .filter((row) => done.get(row.id))
+      .map((row) => store.write(env, row.id, target, done.get(row.id)!, row.version));
+    return writes.length > 0 ? env.DB.batch(writes) : undefined;
+  });
+  // ⚠️ Without a `ctx` there is nowhere to hand unfinished work, so this awaits every
+  // call and the deadline above does nothing. That is correct for the only callers that
+  // lack one — tests and synchronous paths — but it means a NEW call site that forgets
+  // to thread `ctx` silently gets the old blocking behaviour back, at full latency.
+  if (ctx) ctx.waitUntil(flush);
+  else await flush;
+
+  return out;
+}
+
+/** Our own comments. `updated_at` is the version, so an edit invalidates. */
 async function translateRows(
   env: CommentsEnv,
   rows: CommentRow[],
   target: string,
   ctx?: ExecutionContext,
 ): Promise<Record<string, Translated>> {
-  const out: Record<string, Translated> = {};
-  const needed = rows.filter((r) => r.body !== "" && r.lang != null && baseLang(r.lang) !== baseLang(target));
-  if (needed.length === 0) return out;
+  return translate(
+    env,
+    rows.map((r) => ({ id: r.id, body: r.body, lang: r.lang, version: r.updated_at })),
+    target,
+    nativeTranslations,
+    ctx,
+  );
+}
 
-  const placeholders = needed.map(() => "?").join(",");
+/**
+ * How recent a cached row must be for the polling route below to serve it.
+ *
+ * ⚠️ This is a STALENESS guard, not a cache expiry — the row itself lives on and the
+ * authoritative read path keeps serving it via the hash check. The route below has no
+ * source text to hash against (the client sends ids, not bodies), so without a bound it
+ * could hand back a translation of a comment the partner has since edited, and "a stale
+ * translation is worse than none" is the rule this whole cache is keyed on. Bounding to
+ * rows written minutes ago means the only row it can serve is one our own `waitUntil`
+ * just wrote, which is exactly what the client is asking about.
+ */
+const TRANSLATION_POLL_MAX_AGE_MS = 5 * 60 * 1000;
+
+/** Ids one poll may ask about — a merged page is 20 native + 20 archive. */
+const MAX_POLL_IDS = 40;
+
+/**
+ * `GET /api/comments/translations?lang=&ids=` — did the slow ones land yet?
+ *
+ * ⚠️ **Reads the cache and NOTHING else: no model call, no upstream call.** That is the
+ * entire reason it is a route of its own rather than the client re-fetching
+ * `/comments/friends`. A refetch would re-hit commsuni and spend a `read_unit` against a
+ * 120/minute budget on every poll, to re-derive a page the client is already holding —
+ * so polling the real endpoint would cost more than the translation did.
+ *
+ * ⚠️ **Archive rows only.** Native comments come from the edge-cached public path, where
+ * the response is shared per-language and a pending translation resolves for everyone on
+ * the next cache miss; adding them here would mean a second table lookup on a path whose
+ * whole point is to be trivially cheap. If native rows ever need this, `comment_translations`
+ * has no `created_at` and the guard above would need one.
+ *
+ * Session-gated like every other archive read (§1).
+ */
+export async function handleGetTranslations(req: Request, env: CommentsEnv, ctx?: ExecutionContext) {
+  const session = await resolveSession(req, env as any, ctx);
+  if (!session) return json({ error: "unauthorized" }, 401);
+
+  const url = new URL(req.url);
+  const target = (url.searchParams.get("lang") ?? "").slice(0, MAX_LANG);
+  const ids = (url.searchParams.get("ids") ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    // ⚠️ Bare partner UUIDs. The client's own `{slug}:{uuid}` prefix means nothing here
+    // and would match no row — the same trap `archiveUuidOf` exists for on the reply path.
+    .filter((x) => ARCHIVE_ID_RE.test(x))
+    .slice(0, MAX_POLL_IDS);
+
+  if (!target || ids.length === 0) return json({ translations: {} });
+
+  const placeholders = ids.map(() => "?").join(",");
   const { results } = await env.DB.prepare(
-    `SELECT comment_id, text, src_updated_at FROM comment_translations
-      WHERE lang = ? AND comment_id IN (${placeholders})`,
+    `SELECT archive_id, text FROM archive_translations
+      WHERE lang = ? AND created_at > ? AND archive_id IN (${placeholders})`,
   )
-    .bind(target, ...needed.map((r) => r.id))
-    .all<{ comment_id: string; text: string; src_updated_at: number }>();
+    .bind(target, Date.now() - TRANSLATION_POLL_MAX_AGE_MS, ...ids)
+    .all<{ archive_id: string; text: string }>()
+    .catch(() => ({ results: [] as Array<{ archive_id: string; text: string }> }));
 
-  const cached = new Map((results ?? []).map((r) => [r.comment_id, r]));
-  const writes: D1PreparedStatement[] = [];
-  let exhausted = !env.AI;
-  let spent = 0;
+  const translations: Record<string, string> = {};
+  for (const r of results ?? []) translations[r.archive_id] = r.text;
+  return json({ translations });
+}
 
-  for (const row of needed) {
-    const hit = cached.get(row.id);
-    // `src_updated_at` is what makes editing safe: a stale translation would
-    // otherwise stay cached forever while readers see text that no longer
-    // matches the original.
-    if (hit && hit.src_updated_at === row.updated_at) {
-      out[row.id] = { text: hit.text, failed: false };
-      continue;
-    }
-    if (exhausted || spent >= MAX_TRANSLATIONS_PER_REQUEST) {
-      out[row.id] = { text: null, failed: true };
-      continue;
-    }
+/**
+ * A partner's comments, translated in place.
+ *
+ * ⚠️ **Returns new rows rather than mutating.** The array is upstream's payload passed
+ * straight through, and it is also what `addNativeReplyCounts` and the block filter
+ * read; spreading keeps every one of those working on a plain object with two extra
+ * fields, which is exactly what the client's `ArchiveCommentDto` now expects.
+ *
+ * ⚠️ **Keyed on the BARE partner uuid**, which is what `archive_translations` stores.
+ * The client's prefixed `{slug}:{uuid}` id is its own and means nothing here.
+ *
+ * ⚠️ **Top-level rows only.** Upstream also nests a `replies` array on a page row — the
+ * block filter reaches into it — but the client's `ArchiveCommentDto` has no such field
+ * and expands a thread through `/api/archive/comments/{id}/replies` instead, so
+ * translating them here would spend model calls on text nothing renders.
+ *
+ * ⚠️ Rows with no `language` are left alone and are NOT flagged failed. Failed means
+ * "we tried and could not", which is the client's cue to offer on-device translation —
+ * and on-device translation needs a source language just as badly as we do, so offering
+ * it there would be a button that cannot work.
+ */
+export async function translateArchiveRows(
+  env: CommentsEnv,
+  rows: unknown[],
+  target: string,
+  ctx?: ExecutionContext,
+): Promise<unknown[]> {
+  if (!target || rows.length === 0) return rows;
 
-    try {
-      spent++;
-      const result = (await env.AI!.run(TRANSLATION_MODEL, {
-        text: row.body,
-        source_lang: baseLang(row.lang!),
-        target_lang: baseLang(target),
-      })) as { translated_text?: string } | null;
-      const text = result?.translated_text ?? "";
-      if (!text) throw new Error("empty translation");
-      out[row.id] = { text, failed: false };
-      writes.push(
-        env.DB
-          .prepare(
-            `INSERT INTO comment_translations (comment_id, lang, text, src_updated_at)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(comment_id, lang) DO UPDATE
-               SET text = excluded.text, src_updated_at = excluded.src_updated_at`,
-          )
-          .bind(row.id, target, text, row.updated_at),
-      );
-    } catch {
-      // Per comment, never per fetch. One model hiccup must not empty the page.
-      out[row.id] = { text: null, failed: true };
-      exhausted = true;
-    }
-  }
+  const shaped = rows.map((r) => r as { id?: string; text?: string; language?: string | null });
+  const results = await translate(
+    env,
+    shaped
+      .filter((r) => !!r.id)
+      .map((r) => ({
+        id: r.id!,
+        body: r.text ?? "",
+        lang: r.language ?? null,
+        version: srcHash(r.text ?? ""),
+      })),
+    target,
+    archiveTranslations,
+    ctx,
+  );
 
-  // Batched, because each write would otherwise be its own subrequest against the
-  // same 50-per-invocation budget the AI calls are already spending.
-  if (writes.length > 0) {
-    const put = env.DB.batch(writes);
-    if (ctx) ctx.waitUntil(put);
-    else await put;
-  }
-  return out;
+  return rows.map((row, i) => {
+    const hit = results[shaped[i].id ?? ""];
+    if (!hit) return row;
+    return { ...(row as object), translated: hit.text, translationFailed: hit.failed };
+  });
 }
 
 // ── Path 1: the public list (unauthenticated, edge-cached) ──────────────────
@@ -1005,13 +1298,21 @@ export async function handleGetFriendComments(
 
   const url = new URL(req.url);
   const cursor = Number(url.searchParams.get("cursor")) || Number.MAX_SAFE_INTEGER;
+  /**
+   * The reader's language, and the archive half's translation TARGET.
+   *
+   * ⚠️ Absent means "translate nothing", not "translate into English" — an older
+   * client that does not send it must keep getting exactly the response it got before.
+   */
+  const lang = (url.searchParams.get("lang") ?? "").slice(0, MAX_LANG);
 
   /**
    * ⚠️ Started BEFORE the D1 work and awaited after it, so the upstream round trip
    * overlaps the queries rather than being serialised behind them. The friends path
    * spends ~6 subrequests today against the free plan's 50; the archive fetch plus its
-   * D1 lookups adds ~5, so there is headroom — but only because the translation tier
-   * does not run on archive rows.
+   * D1 lookups adds ~5, and translating the page adds a cache read, a batched write and
+   * up to [ARCHIVE_PAGE_LIMIT] AI calls on a page nobody has read in this language yet.
+   * Still inside the cap, and steady state is the cache read alone.
    *
    * `.catch(() => null)` because this must never reject the whole response: a broken
    * archive hides its own section and nothing else.
@@ -1062,8 +1363,20 @@ export async function handleGetFriendComments(
   // ⚠️ Our replies are counted onto the partner's rows before they go out. The archive
   // cannot know about a reply living in our database, so without this the expander is
   // missing on exactly the thread someone just replied to.
+  //
+  // ⚠️ Translation runs FIRST, on the partner's own fields, and the reply counts are
+  // added to what it returns — not the other way round. `translateArchiveRows` rebuilds
+  // each row by spreading, so running it second would spread over the counted row and
+  // keep the count, but only by accident; ordering it first means neither pass has to
+  // know what the other added.
   const archive = archivePage
-    ? { ...archivePage, comments: await addNativeReplyCounts(env, archivePage.comments) }
+    ? {
+        ...archivePage,
+        comments: await addNativeReplyCounts(
+          env,
+          await translateArchiveRows(env, archivePage.comments, lang, ctx),
+        ),
+      }
     : archivePage;
   return json({
     comments: await withInlineReplies(env, rows, counts),

@@ -21,17 +21,20 @@ import { refPath, resolveReference, type MediaType } from "./commsuniEntities";
 const MISS_TTL_MS = 6 * 60 * 60 * 1000;
 
 /** Matches PAGE_LIMIT so the merged list is not lopsided against the native half. */
-const ARCHIVE_PAGE_LIMIT = 20;
+export const ARCHIVE_PAGE_LIMIT = 20;
 
 /**
  * One page of archive replies.
  *
- * Larger than the native REPLY_PAGE_LIMIT of 10 because archive replies are **not
- * translated** (see Phase 1), so a page costs no AI calls — only the single subrequest
- * it takes to fetch. The native limit is small precisely because a fully untranslated
- * page there spends one model call per reply.
+ * ⚠️ **10, down from 25, because archive replies are now translated too.** The 25 was
+ * justified by their being the one page that cost no AI calls; once a reply can spend a
+ * model call the same arithmetic that sizes the native REPLY_PAGE_LIMIT applies here,
+ * and this route pays it twice — the partner's replies through `translateArchiveRows`
+ * and ours through `loadNativeArchiveReplies`. Leaving it at 25 put a busy thread's
+ * first read in a new language at ~38 subrequests against a cap of 50, for pages the
+ * cursor fetches on demand anyway.
  */
-const ARCHIVE_REPLY_LIMIT = 25;
+const ARCHIVE_REPLY_LIMIT = 10;
 
 /**
  * The archive half of a comments response, or null.
