@@ -23,6 +23,9 @@ class FakeStorage {
     for (const [k, v] of this.map) if (k.startsWith(prefix)) out.set(k, v as T);
     return out;
   }
+  async delete(keys: string | string[]): Promise<void> {
+    for (const k of Array.isArray(keys) ? keys : [keys]) this.map.delete(k);
+  }
   async deleteAll(): Promise<void> {
     this.map.clear();
   }
@@ -491,5 +494,109 @@ describe("group watch — caps", () => {
     const ws = await connect(s, hostId, "Sam", true);
     await send(s.obj, ws, { t: "start", deck: [603, "x", null, -1, 0, 604] as any });
     expect(ws.of("deck")[0].items).toEqual([603, 604]);
+  });
+});
+
+describe("group watch — moderation", () => {
+  async function lobby() {
+    const s = session();
+    await doFetch(s.obj, "create", { code: "ABC234", hostName: "Sam" });
+    const hostId = (s.state.storage.map.get("meta") as any).hostId;
+    const host = await connect(s, hostId, "Sam", true);
+    const guest = await connect(s, "GUEST00001", "Alex");
+    return { ...s, host, guest, hostId };
+  }
+
+  /** Opening a socket without the upgrade dance, so the REFUSAL paths are reachable. */
+  const tryJoin = (obj: GroupSession, query: string) =>
+    obj.fetch(new Request(`https://do/ws?${query}`, { headers: { Upgrade: "websocket" } }));
+
+  it("lets the host close and reopen the room", async () => {
+    const g = await lobby();
+    await send(g.obj, g.host, { t: "lock", locked: true });
+    expect((g.state.storage.map.get("meta") as any).locked).toBe(true);
+    expect(g.guest.of("locked")[0].locked).toBe(true);
+
+    await send(g.obj, g.host, { t: "lock", locked: false });
+    expect((g.state.storage.map.get("meta") as any).locked).toBe(false);
+  });
+
+  it("refuses a guest a lock", async () => {
+    const g = await lobby();
+    await send(g.obj, g.guest, { t: "lock", locked: true });
+    expect(g.guest.of("error")[0].message).toBe("not_host");
+    expect((g.state.storage.map.get("meta") as any).locked).toBeUndefined();
+  });
+
+  it("turns a new joiner away from a locked room", async () => {
+    const g = await lobby();
+    await send(g.obj, g.host, { t: "lock", locked: true });
+    expect((await tryJoin(g.obj, "name=Nobody")).status).toBe(403);
+  });
+
+  /**
+   * ⚠️ The lock stops NEW seats only. Someone already in the room whose socket dropped —
+   * a tunnel, a locked phone — must be able to come back, or closing the room would slowly
+   * empty it.
+   */
+  it("still lets someone already inside reconnect", async () => {
+    const g = await lobby();
+    await send(g.obj, g.host, { t: "lock", locked: true });
+    // Not a 403: it gets past every refusal and dies on WebSocketPair, which does not exist
+    // outside workerd. Reaching that is the assertion.
+    await expect(tryJoin(g.obj, "id=GUEST00001")).rejects.toBeTruthy();
+  });
+
+  it("removes a participant and everything they contributed", async () => {
+    const g = await lobby();
+    await send(g.obj, g.guest, { t: "profile", profile: '{"displayName":"Alex"}' });
+    await send(g.obj, g.host, { t: "start", deck: [603] });
+    await send(g.obj, g.guest, { t: "vote", tmdbId: 603, liked: true });
+    expect(g.state.storage.map.has("pf:GUEST00001")).toBe(true);
+    expect(g.state.storage.map.has("v:GUEST00001")).toBe(true);
+
+    await send(g.obj, g.host, { t: "kick", id: "GUEST00001" });
+
+    // ⚠️ Not merely disconnected. A removed participant must stop influencing the deck the
+    // rest of the session swipes, and a leftover profile or vote would do exactly that.
+    expect(g.state.storage.map.has("p:GUEST00001")).toBe(false);
+    expect(g.state.storage.map.has("pf:GUEST00001")).toBe(false);
+    expect(g.state.storage.map.has("v:GUEST00001")).toBe(false);
+    expect(g.guest.closed).not.toBeNull();
+    expect(g.host.of("left")[0].id).toBe("GUEST00001");
+  });
+
+  /** ⚠️ A client still holds its old id. Without the tombstone it could simply walk back in. */
+  it("keeps a removed participant out even with their old id", async () => {
+    const g = await lobby();
+    await send(g.obj, g.host, { t: "kick", id: "GUEST00001" });
+    expect((await tryJoin(g.obj, "id=GUEST00001")).status).toBe(403);
+  });
+
+  it("refuses a guest a kick", async () => {
+    const g = await lobby();
+    await send(g.obj, g.guest, { t: "kick", id: (g as any).hostId });
+    expect(g.guest.of("error")[0].message).toBe("not_host");
+  });
+
+  /** ⚠️ `end` is how a host leaves. Kicking itself would strand a session nobody can stop. */
+  it("will not let the host kick itself", async () => {
+    const g = await lobby();
+    await send(g.obj, g.host, { t: "kick", id: g.hostId });
+    expect(g.host.of("error")[0].message).toBe("bad_target");
+    expect(g.state.storage.map.has(`p:${g.hostId}`)).toBe(true);
+  });
+
+  it("reports an unknown target rather than silently succeeding", async () => {
+    const g = await lobby();
+    await send(g.obj, g.host, { t: "kick", id: "NOBODY0001" });
+    expect(g.host.of("error")[0].message).toBe("not_here");
+  });
+
+  it("tells a join screen the room is locked", async () => {
+    const g = await lobby();
+    await send(g.obj, g.host, { t: "lock", locked: true });
+    const meta = (await (await doFetch(g.obj, "meta")).json()) as any;
+    expect(meta.locked).toBe(true);
   });
 });

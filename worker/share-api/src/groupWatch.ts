@@ -104,6 +104,13 @@ interface SessionMeta {
   state: SessionState;
   /** Set once, when the host starts. Everyone swipes this exact order. */
   deck: number[];
+  /**
+   * Host has closed the room. New seats are refused; existing ones still reconnect.
+   *
+   * ⚠️ Optional so a session created by an older deploy reads as unlocked rather than
+   * `undefined` — which would be falsy anyway, but says so on purpose.
+   */
+  locked?: boolean;
 }
 
 interface Participant {
@@ -230,6 +237,7 @@ export class GroupSession implements DurableObject {
       hostName: people.find((p) => p.isHost)?.name ?? "Someone",
       participantCount: people.length,
       full: people.length >= MAX_PARTICIPANTS,
+      locked: m.locked === true,
       expiresAt: m.lastActivityAt + IDLE_MS,
     });
   }
@@ -247,6 +255,18 @@ export class GroupSession implements DurableObject {
     const existing = people.find((p) => p.id === claimed);
     if (!existing && people.length >= MAX_PARTICIPANTS) {
       return json({ error: "session_full" }, 409);
+    }
+    // ⚠️ The lock stops NEW seats only. `existing` is someone already in the room whose
+    // socket dropped, and refusing them would turn a tunnel or a locked phone into an
+    // ejection — the room would then bleed people every time it was closed.
+    if (!existing && m.locked) return json({ error: "session_locked" }, 403);
+    // ⚠️ A kicked participant's id is remembered, so they cannot walk back in by replaying
+    // the id their client still holds. Cleared only when the session is deleted.
+    if (!existing && (await this.isKicked(claimed))) {
+      return json({ error: "removed" }, 403);
+    }
+    if (existing && (await this.isKicked(existing.id))) {
+      return json({ error: "removed" }, 403);
     }
 
     const participant: Participant = existing ?? {
@@ -297,7 +317,15 @@ export class GroupSession implements DurableObject {
     const att = ws.deserializeAttachment() as SocketAttachment | null;
     if (!att) return;
 
-    let msg: { t?: string; tmdbId?: unknown; liked?: unknown; deck?: unknown; profile?: unknown };
+    let msg: {
+      t?: string;
+      tmdbId?: unknown;
+      liked?: unknown;
+      deck?: unknown;
+      profile?: unknown;
+      locked?: unknown;
+      id?: unknown;
+    };
     try {
       msg = JSON.parse(raw);
     } catch {
@@ -314,6 +342,10 @@ export class GroupSession implements DurableObject {
         return this.onProfile(ws, att, m, msg.profile);
       case "vote":
         return this.onVote(ws, att, m, msg.tmdbId, msg.liked);
+      case "lock":
+        return this.onLock(ws, att, m, msg.locked);
+      case "kick":
+        return this.onKick(ws, att, m, msg.id);
       case "end":
         return this.onEnd(att, m);
       default:
@@ -470,6 +502,80 @@ export class GroupSession implements DurableObject {
     await this.ctx.storage.put("matched", announced);
 
     this.broadcast({ t: "match", tmdbId, participants: connected.length });
+  }
+
+  /**
+   * Host closes or reopens the room.
+   *
+   * ## Why a lock and a kick, and NOT an approval queue
+   *
+   * `matchAdhoc.ts` states the trap this feature inherits: a guest has no stable identity,
+   * so they cannot be blocked. The mitigations therefore have to be structural, and the
+   * structural problem here is specific — a join link is a mutable audience, so the real
+   * risk is the link being forwarded past the people it was sent to.
+   *
+   * A lock answers exactly that: once everyone is in, the code stops working. An approval
+   * queue would answer it too, but it puts a dialog in front of every ordinary join —
+   * including the browser guest the whole feature exists for, who is the least patient
+   * participant in the session — to defend against a case that a single tap already closes.
+   * The cheaper mechanism covers the same ground, so it is the one that ships.
+   */
+  private async onLock(
+    ws: WebSocket,
+    att: SocketAttachment,
+    m: SessionMeta,
+    lockedRaw: unknown,
+  ): Promise<void> {
+    if (att.participantId !== m.hostId) return this.send(ws, { t: "error", message: "not_host" });
+    m.locked = lockedRaw === true;
+    await this.touch(m);
+    this.broadcast({ t: "locked", locked: m.locked });
+  }
+
+  /**
+   * Host removes a participant.
+   *
+   * ⚠️ Their taste payload and votes are DELETED, not merely disconnected. Someone removed
+   * from a session must not keep influencing the deck the rest of it swipes, and leaving
+   * `pf:`/`v:` behind would do exactly that — silently, since nothing on screen names them
+   * any more.
+   *
+   * ⚠️ The host cannot kick itself. `end` is that, and this would leave a session with
+   * nobody able to start or stop it.
+   */
+  private async onKick(
+    ws: WebSocket,
+    att: SocketAttachment,
+    m: SessionMeta,
+    idRaw: unknown,
+  ): Promise<void> {
+    if (att.participantId !== m.hostId) return this.send(ws, { t: "error", message: "not_host" });
+    const id = typeof idRaw === "string" ? idRaw : "";
+    if (!id || id === m.hostId) return this.send(ws, { t: "error", message: "bad_target" });
+    if (!(await this.ctx.storage.get<Participant>(`p:${id}`))) {
+      return this.send(ws, { t: "error", message: "not_here" });
+    }
+
+    await this.ctx.storage.put(`k:${id}`, true);
+    await this.ctx.storage.delete([`p:${id}`, `v:${id}`, `pf:${id}`]);
+    await this.touch(m);
+
+    for (const sock of this.ctx.getWebSockets()) {
+      const a = sock.deserializeAttachment() as SocketAttachment | null;
+      if (a?.participantId !== id) continue;
+      this.send(sock, { t: "ended", reason: "removed" });
+      try {
+        sock.close(1000, "removed");
+      } catch {
+        // Already torn down; the roster broadcast below is what matters.
+      }
+    }
+    this.broadcast({ t: "left", id });
+  }
+
+  private async isKicked(id: string): Promise<boolean> {
+    if (!id) return false;
+    return (await this.ctx.storage.get<boolean>(`k:${id}`)) === true;
   }
 
   private async onEnd(att: SocketAttachment, m: SessionMeta): Promise<void> {
