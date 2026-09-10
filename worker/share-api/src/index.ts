@@ -1,5 +1,9 @@
 interface Env {
   BUCKET: R2Bucket;
+  /** Group Watch sessions. One Durable Object per session code — see groupWatch.ts. */
+  GROUP_SESSION: DurableObjectNamespace;
+  /** Group Watch sessions created per IP per hour. */
+  GROUP_WATCH_PER_HOUR?: string;
   SHARE_TTL_SECONDS: string;
   MAX_ITEMS: string;
   RATE_LIMIT_PER_HOUR: string;
@@ -93,6 +97,7 @@ import {
 import { reapOrphanProfiles, reapOldReports, dueForReap } from "./reaper";
 import { handleAccountLink, handleAccountResolve, handleAccountUnlink, deleteAccountForFriend } from "./account";
 import { handleAuthSession, handleAuthLogout, handleAuthProbe, resolveSession } from "./auth";
+import { GroupSession, handleWatchCreate, handleWatchMeta, handleWatchSocket } from "./groupWatch";
 import { handleClearFeed, handleGetFeed, handlePublishFeed } from "./feed";
 import {
   handleAcceptSharedList,
@@ -342,6 +347,22 @@ export default {
 
     const landing = p.match(/^\/share\/([A-Z0-9]{6,12})$/);
     if (landing && req.method === "GET") return handleLanding(landing[1], env);
+
+    // ── Group Watch (Durable Object per session) ──
+    //
+    // ⚠️ Each of these needs its own zone-route pattern in wrangler.toml. A pattern matches
+    // the FULL url including query string, and `/api/watch/*` does not match a bare
+    // `/api/watch` — so the create route is listed separately from the code routes.
+    if (p === "/api/watch" && req.method === "POST") {
+      const ip = req.headers.get("CF-Connecting-IP") ?? "unknown";
+      return handleWatchCreate(req, env, (scope, limit) => rateLimited(env, scope, ip, limit));
+    }
+
+    const watchSocket = p.match(/^\/api\/watch\/([0-9A-HJ-NP-TV-Z]{6})\/ws$/);
+    if (watchSocket && req.method === "GET") return handleWatchSocket(watchSocket[1], req, env);
+
+    const watchMeta = p.match(/^\/api\/watch\/([0-9A-HJ-NP-TV-Z]{6})$/);
+    if (watchMeta && req.method === "GET") return handleWatchMeta(watchMeta[1], env);
 
     // ── Opinion batch (blind-indexed, on-demand reads) ──
     if (p === "/api/opinions/batch" && req.method === "POST") {
@@ -2309,6 +2330,7 @@ function htmlEscape(s: string): string {
 //   flickd-content/content/privacy.html
 //   flickd-content/content/delete.html
 
-
-
-
+// ⚠️ Re-exported from the worker entry because that is the only place wrangler looks for a
+// Durable Object class. A binding whose `class_name` is not exported here fails at DEPLOY
+// time with "class not found", never at build or test time.
+export { GroupSession };

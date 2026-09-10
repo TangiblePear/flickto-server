@@ -11,6 +11,14 @@ routes = [
   { pattern = "flickto.app/api/share", zone_name = "flickto.app" },
   { pattern = "flickto.app/api/share/*", zone_name = "flickto.app" },
   { pattern = "flickto.app/share/*", zone_name = "flickto.app" },
+  # Group Watch. ⚠️ THREE patterns, not one. A pattern matches the full URL, and
+  # `/api/watch/*` does NOT match the bare `/api/watch` the create call posts to — the
+  # exact trap the commentary further down was written for. Verify each with a live curl
+  # after deploy: 405 = the worker was never reached, 404 = reached but no handler,
+  # 400/426 = reached and handled.
+  { pattern = "flickto.app/api/watch", zone_name = "flickto.app" },
+  { pattern = "flickto.app/api/watch/*", zone_name = "flickto.app" },
+  { pattern = "flickto.app/watch/*", zone_name = "flickto.app" },
   { pattern = "flickto.app/api/user/*", zone_name = "flickto.app" },
   { pattern = "flickto.app/api/opinions/batch", zone_name = "flickto.app" },
   { pattern = "flickto.app/api/friendcode", zone_name = "flickto.app" },
@@ -229,6 +237,25 @@ routes = [
 # These live in Cloudflare, not in this file, so nothing here can enforce them.
 # Treat a claim in a comment as a claim, not a fact: check the list before relying
 # on one — that is exactly how the policy came to say something untrue.
+# ── Group Watch (Durable Objects) ────────────────────────────────────────────
+#
+# The first Durable Object in this account. ⚠️ Requires the Workers PAID plan — DOs are not
+# available on Free, which is the same reason `[limits] cpu_ms` could not be set on the
+# scoring worker. See src/groupWatch.ts for why a socket is cheaper here than polling.
+[[durable_objects.bindings]]
+name = "GROUP_SESSION"
+class_name = "GroupSession"
+
+# ⚠️ `new_sqlite_classes`, not `new_classes`. SQLite-backed storage is the current backend
+# for new namespaces; a namespace created on the legacy KV backend cannot be moved to it
+# afterwards.
+#
+# ⚠️ A migration tag is applied ONCE and recorded server-side. Renaming or renumbering `v1`
+# after a deploy makes wrangler try to create a namespace that already exists.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GroupSession"]
+
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "flickto-social"
@@ -332,6 +359,11 @@ dataset = "history_events"
 
 
 [vars]
+# Group Watch sessions one IP may create per hour. Enforced by the R2 hourly-bucket helper
+# in index.ts — NOT the native `unsafe.bindings` ratelimit, which was measured on
+# 2026-08-15 to deploy cleanly and never actually limit, failing open and silently.
+GROUP_WATCH_PER_HOUR = "20"
+
 # Cloudflare account id, for the Analytics Engine SQL API (src/history.ts). Reading a
 # dataset is an ACCOUNT-level HTTP call, not a binding — the `HISTORY_ANALYTICS`
 # binding only writes. The matching credential is a SECRET:
