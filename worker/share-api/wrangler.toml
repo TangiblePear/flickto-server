@@ -11,14 +11,20 @@ routes = [
   { pattern = "flickto.app/api/share", zone_name = "flickto.app" },
   { pattern = "flickto.app/api/share/*", zone_name = "flickto.app" },
   { pattern = "flickto.app/share/*", zone_name = "flickto.app" },
-  # Group Watch. ⚠️ THREE patterns, not one. A pattern matches the full URL, and
+  # Group Watch API. ⚠️ TWO patterns, not one. A pattern matches the full URL, and
   # `/api/watch/*` does NOT match the bare `/api/watch` the create call posts to — the
-  # exact trap the commentary further down was written for. Verify each with a live curl
-  # after deploy: 405 = the worker was never reached, 404 = reached but no handler,
-  # 400/426 = reached and handled.
+  # exact trap the commentary further down was written for. Verified live on 2026-09-10:
+  # 200 on the bare create, 404 on an unknown code, 426 on /ws without an upgrade.
+  #
+  # ⚠️ `flickto.app/watch/*` is deliberately NOT here, and must not be added. That path is
+  # the human-facing session page and belongs to flickto-web's Pages Functions, exactly as
+  # `/friend/*` and `/u/*` do — neither of which appears in this file. A route belongs to
+  # exactly ONE worker, so claiming it here silently shadows Pages: it was bound briefly on
+  # 2026-09-10 and every `/watch/{code}` returned 404 from this worker, which is precisely
+  # what that shadowing looks like. `/share/*` is the exception, and only because its
+  # landing page is rendered by `handleLanding` in this worker.
   { pattern = "flickto.app/api/watch", zone_name = "flickto.app" },
   { pattern = "flickto.app/api/watch/*", zone_name = "flickto.app" },
-  { pattern = "flickto.app/watch/*", zone_name = "flickto.app" },
   { pattern = "flickto.app/api/user/*", zone_name = "flickto.app" },
   { pattern = "flickto.app/api/opinions/batch", zone_name = "flickto.app" },
   { pattern = "flickto.app/api/friendcode", zone_name = "flickto.app" },
