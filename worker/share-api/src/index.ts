@@ -358,10 +358,10 @@ export default {
       return handleWatchCreate(req, env, (scope, limit) => rateLimited(env, scope, ip, limit));
     }
 
-    const watchSocket = p.match(/^\/api\/watch\/([0-9A-HJ-NP-TV-Z]{6})\/ws$/);
+    const watchSocket = p.match(/^\/api\/watch\/([0-9A-HJKMNP-TV-Z]{6})\/ws$/);
     if (watchSocket && req.method === "GET") return handleWatchSocket(watchSocket[1], req, env);
 
-    const watchMeta = p.match(/^\/api\/watch\/([0-9A-HJ-NP-TV-Z]{6})$/);
+    const watchMeta = p.match(/^\/api\/watch\/([0-9A-HJKMNP-TV-Z]{6})$/);
     if (watchMeta && req.method === "GET") return handleWatchMeta(watchMeta[1], env);
 
     // ── Opinion batch (blind-indexed, on-demand reads) ──
