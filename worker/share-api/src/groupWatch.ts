@@ -94,7 +94,12 @@ const MAX_PROFILE_BYTES = 96 * 1024;
 const MAX_DECK = 500;
 const DEFAULT_SESSIONS_PER_HOUR = 20;
 
-type SessionState = "lobby" | "swiping" | "ended";
+/**
+ * ⚠️ "results" is a LIVE state, not an ending. Everyone is still connected and looking at
+ * what they agreed on; the session only becomes "ended" when the host closes it or the alarm
+ * fires. Collapsing the two would mean the only way to see the result was to destroy it.
+ */
+type SessionState = "lobby" | "swiping" | "results" | "ended";
 
 interface SessionMeta {
   code: string;
@@ -104,6 +109,18 @@ interface SessionMeta {
   state: SessionState;
   /** Set once, when the host starts. Everyone swipes this exact order. */
   deck: number[];
+  /**
+   * Fit score 0–100 per [deck] entry, same order and length, from the host's scoring run.
+   *
+   * ⚠️ This is session state, NOT title metadata — "how well this film suits THIS group" is
+   * meaningless outside the session and cannot be looked up anywhere else, which is exactly
+   * why it travels here while titles and posters deliberately do not.
+   *
+   * ⚠️ Optional: a client that predates it sends no scores and the deck still works. Empty
+   * and mismatched-length both read as "no scores", never as zeroes — a zero would render as
+   * a confident 0% match.
+   */
+  scores?: number[];
   /**
    * Host has closed the room. New seats are refused; existing ones still reconnect.
    *
@@ -295,7 +312,11 @@ export class GroupSession implements DurableObject {
       you: participant,
       state: m.state,
       participants: roster,
-      deck: m.state === "swiping" ? m.deck : undefined,
+      // ⚠️ Also in "results": a participant reconnecting after the finish still needs the deck
+      // to render what everyone agreed on, or their results screen is a list of bare numbers.
+      deck: m.state === "swiping" || m.state === "results" ? m.deck : undefined,
+      scores: m.state === "swiping" || m.state === "results" ? m.scores : undefined,
+      results: m.state === "results" ? await this.tally(m) : undefined,
       maxParticipants: MAX_PARTICIPANTS,
       // Who has submitted a taste profile, so a lobby can show readiness.
       ready: Object.keys(collected),
@@ -322,6 +343,7 @@ export class GroupSession implements DurableObject {
       tmdbId?: unknown;
       liked?: unknown;
       deck?: unknown;
+      scores?: unknown;
       profile?: unknown;
       locked?: unknown;
       id?: unknown;
@@ -337,7 +359,9 @@ export class GroupSession implements DurableObject {
 
     switch (msg.t) {
       case "start":
-        return this.onStart(ws, att, m, msg.deck);
+        return this.onStart(ws, att, m, msg.deck, msg.scores);
+      case "finish":
+        return this.onFinish(ws, att, m);
       case "profile":
         return this.onProfile(ws, att, m, msg.profile);
       case "vote":
@@ -374,6 +398,7 @@ export class GroupSession implements DurableObject {
     att: SocketAttachment,
     m: SessionMeta,
     deck: unknown,
+    scores: unknown,
   ): Promise<void> {
     if (att.participantId !== m.hostId) return this.send(ws, { t: "error", message: "not_host" });
     if (m.state !== "lobby") return this.send(ws, { t: "error", message: "already_started" });
@@ -383,10 +408,86 @@ export class GroupSession implements DurableObject {
       : [];
     if (ids.length === 0) return this.send(ws, { t: "error", message: "empty_deck" });
 
+    // ⚠️ Kept ONLY when there is exactly one score per surviving id. The filter above can drop
+    // entries, so a raw parallel array may no longer line up — and a misaligned score is worse
+    // than none, because it labels each film with its neighbour's match.
+    const raw = Array.isArray(scores) ? scores : [];
+    const fit =
+      raw.length === (Array.isArray(deck) ? deck.length : -1) && ids.length === raw.length
+        ? raw.map((n) => (Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n as number))) : 0))
+        : undefined;
+
     m.deck = ids;
+    m.scores = fit;
     m.state = "swiping";
     await this.touch(m);
-    this.broadcast({ t: "deck", items: ids, state: "swiping" });
+    this.broadcast({ t: "deck", items: ids, scores: fit, state: "swiping" });
+  }
+
+  /**
+   * Stop swiping and show everyone what they agreed on.
+   *
+   * ⚠️ This is NOT `end`. The session stays alive and its storage intact, so every participant
+   * — including one who reconnects afterwards — sees the same result. `end` is the destructive
+   * one, and making the only route to a result also destroy it would have been indefensible.
+   *
+   * ⚠️ Reached by the host tapping finish OR by everyone running out of deck, and both land
+   * here rather than in two places that could disagree about what a result is.
+   */
+  private async finish(m: SessionMeta): Promise<void> {
+    if (m.state !== "swiping") return;
+    m.state = "results";
+    await this.touch(m);
+    this.broadcast({ t: "results", ...(await this.tally(m)) });
+  }
+
+  private async onFinish(ws: WebSocket, att: SocketAttachment, m: SessionMeta): Promise<void> {
+    if (att.participantId !== m.hostId) return this.send(ws, { t: "error", message: "not_host" });
+    await this.finish(m);
+  }
+
+  /**
+   * What the group actually decided.
+   *
+   * `matches` are the unanimous ones already announced, newest last. `liked` counts every
+   * like per title so a near-miss — four out of five — can be shown too, which is usually the
+   * more useful list when nothing was unanimous.
+   */
+  private async tally(m: SessionMeta): Promise<{ matches: number[]; liked: Record<string, number>; voters: number }> {
+    const matches = (await this.ctx.storage.get<number[]>("matched")) ?? [];
+    const liked: Record<string, number> = {};
+    let voters = 0;
+    for (const p of await this.participants()) {
+      const votes = await this.votesOf(p.id);
+      // ⚠️ Whoever actually SWIPED, not whoever is in the room. Someone who joined to watch
+      // the result, or arrived after the finish, is not a voter — counting them turns
+      // "2 of 2 liked this" into "2 of 3" and makes a unanimous pick look like a near-miss.
+      if (Object.keys(votes).length === 0) continue;
+      voters += 1;
+      for (const [tmdbId, wasLiked] of Object.entries(votes)) {
+        if (wasLiked) liked[tmdbId] = (liked[tmdbId] ?? 0) + 1;
+      }
+    }
+    return { matches, liked, voters };
+  }
+
+  /**
+   * Everyone connected has voted on the whole deck, so there is nothing left to wait for.
+   *
+   * ⚠️ Connected participants only, matching [checkMatch]. Someone who closed their tab must
+   * not hold the results screen hostage for the people still swiping.
+   */
+  private async maybeAutoFinish(m: SessionMeta): Promise<void> {
+    if (m.state !== "swiping" || m.deck.length === 0) return;
+    const connected = this.connectedParticipantIds();
+    if (connected.length === 0) return;
+    for (const id of connected) {
+      const votes = await this.votesOf(id);
+      for (const tmdbId of m.deck) {
+        if (votes[String(tmdbId)] === undefined) return;
+      }
+    }
+    await this.finish(m);
   }
 
   /**
@@ -474,6 +575,7 @@ export class GroupSession implements DurableObject {
     this.broadcast({ t: "vote", id: att.participantId, tmdbId, liked });
 
     if (liked) await this.checkMatch(tmdbId);
+    await this.maybeAutoFinish(m);
   }
 
   /**

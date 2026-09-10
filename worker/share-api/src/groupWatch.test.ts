@@ -600,3 +600,146 @@ describe("group watch — moderation", () => {
     expect(meta.locked).toBe(true);
   });
 });
+
+describe("group watch — scores and results", () => {
+  async function swiping(deck = [603, 604], scores?: number[]) {
+    const s = session();
+    await doFetch(s.obj, "create", { code: "ABC234", hostName: "Sam" });
+    const hostId = (s.state.storage.map.get("meta") as any).hostId;
+    const host = await connect(s, hostId, "Sam", true);
+    const guest = await connect(s, "GUEST00001", "Alex");
+    await send(s.obj, host, { t: "start", deck, scores });
+    return { ...s, host, guest, hostId };
+  }
+
+  it("carries a fit score per card", async () => {
+    const g = await swiping([603, 604], [91, 74]);
+    expect(g.guest.of("deck")[0].scores).toEqual([91, 74]);
+  });
+
+  /**
+   * ⚠️ A misaligned score is WORSE than none: it labels every film with its neighbour's
+   * match. `start` filters out non-positive ids, so a parallel array can silently stop
+   * lining up — and the only safe answer is to drop the scores entirely.
+   */
+  it("drops scores that no longer line up with the deck", async () => {
+    const g = await swiping([603, -1, 604], [91, 50, 74]);
+    expect(g.guest.of("deck")[0].items).toEqual([603, 604]);
+    expect(g.guest.of("deck")[0].scores).toBeUndefined();
+  });
+
+  it("drops a score array of the wrong length", async () => {
+    const g = await swiping([603, 604], [91]);
+    expect(g.guest.of("deck")[0].scores).toBeUndefined();
+  });
+
+  /** ⚠️ Clamped to 0–100. A client sending 3000 must not render as a 3000% match. */
+  it("clamps and rounds what it is given", async () => {
+    const g = await swiping([603, 604], [3000, -12.6]);
+    expect(g.guest.of("deck")[0].scores).toEqual([100, 0]);
+  });
+
+  it("still works with no scores at all", async () => {
+    const g = await swiping([603, 604]);
+    expect(g.guest.of("deck")[0].items).toEqual([603, 604]);
+    expect(g.guest.of("deck")[0].scores).toBeUndefined();
+  });
+
+  it("lets the host stop early and show everyone the result", async () => {
+    const g = await swiping();
+    await send(g.obj, g.host, { t: "vote", tmdbId: 603, liked: true });
+    await send(g.obj, g.guest, { t: "vote", tmdbId: 603, liked: true });
+    await send(g.obj, g.host, { t: "finish" });
+
+    const results = g.guest.of("results")[0];
+    expect(results.matches).toEqual([603]);
+    expect(results.liked["603"]).toBe(2);
+    expect(results.voters).toBe(2);
+    expect((g.state.storage.map.get("meta") as any).state).toBe("results");
+  });
+
+  /**
+   * ⚠️ Finishing is NOT ending. Everyone is still connected looking at the result, and the
+   * storage has to survive or a reconnect lands on an empty session. `end` is the
+   * destructive one — making the only route to a result also destroy it would be absurd.
+   */
+  it("keeps the session alive after finishing", async () => {
+    const g = await swiping();
+    await send(g.obj, g.host, { t: "finish" });
+    expect(g.state.storage.map.has("meta")).toBe(true);
+    expect((await doFetch(g.obj, "meta")).status).toBe(200);
+    expect(g.guest.closed).toBeNull();
+  });
+
+  /**
+   * ⚠️ Whoever SWIPED, not whoever is in the room. A latecomer who joined to see the result
+   * would otherwise turn "2 of 2 liked this" into "2 of 3" and make a unanimous pick read as
+   * a near-miss. Caught on a live session, 2026-09-10.
+   */
+  it("counts voters, not spectators", async () => {
+    const g = await swiping();
+    await send(g.obj, g.host, { t: "vote", tmdbId: 603, liked: true });
+    await send(g.obj, g.guest, { t: "vote", tmdbId: 603, liked: true });
+    await connect(g, "LATE000001", "Latecomer");
+    await send(g.obj, g.host, { t: "finish" });
+
+    const results = g.guest.of("results")[0];
+    expect(results.voters).toBe(2);
+    expect(results.liked["603"]).toBe(2);
+  });
+
+  it("refuses a guest the finish", async () => {
+    const g = await swiping();
+    await send(g.obj, g.guest, { t: "finish" });
+    expect(g.guest.of("error").at(-1).message).toBe("not_host");
+    expect((g.state.storage.map.get("meta") as any).state).toBe("swiping");
+  });
+
+  /** Nothing left to wait for once everyone connected has answered every card. */
+  it("finishes on its own when the deck runs out", async () => {
+    const g = await swiping([603, 604]);
+    for (const tmdbId of [603, 604]) {
+      await send(g.obj, g.host, { t: "vote", tmdbId, liked: true });
+      await send(g.obj, g.guest, { t: "vote", tmdbId, liked: tmdbId === 603 });
+    }
+    expect((g.state.storage.map.get("meta") as any).state).toBe("results");
+    const results = g.host.of("results")[0];
+    expect(results.matches).toEqual([603]);
+    expect(results.liked["604"]).toBe(1);
+  });
+
+  /** ⚠️ Not while someone is still swiping — a half-finished deck must not end the session. */
+  it("does not finish while anyone still has cards left", async () => {
+    const g = await swiping([603, 604]);
+    await send(g.obj, g.host, { t: "vote", tmdbId: 603, liked: true });
+    await send(g.obj, g.host, { t: "vote", tmdbId: 604, liked: true });
+    await send(g.obj, g.guest, { t: "vote", tmdbId: 603, liked: true });
+    expect((g.state.storage.map.get("meta") as any).state).toBe("swiping");
+  });
+
+  it("refuses votes once the results are up", async () => {
+    const g = await swiping();
+    await send(g.obj, g.host, { t: "finish" });
+    await send(g.obj, g.guest, { t: "vote", tmdbId: 603, liked: true });
+    expect(g.guest.of("error").at(-1).message).toBe("not_started");
+  });
+
+  /**
+   * ⚠️ A reconnect after the finish needs the DECK as well as the tally, or its results
+   * screen is a list of bare numbers with nothing to render.
+   */
+  it("replays the deck and the result to someone who reconnects", async () => {
+    const g = await swiping([603, 604], [91, 74]);
+    await send(g.obj, g.host, { t: "vote", tmdbId: 603, liked: true });
+    await send(g.obj, g.guest, { t: "vote", tmdbId: 603, liked: true });
+    await send(g.obj, g.host, { t: "finish" });
+
+    const back = await connect(g, "GUEST00001", "Alex");
+    await (g.obj as any).fetch(new Request("https://do/meta"));
+    // welcome is sent by socket(), which cannot run outside workerd — assert the state the
+    // reconnect would be handed instead.
+    const meta = await (await doFetch(g.obj, "meta")).json() as any;
+    expect(meta.state).toBe("results");
+    expect(back).toBeTruthy();
+  });
+});
