@@ -222,6 +222,90 @@ describe("group watch — starting", () => {
   });
 });
 
+describe("group watch — taste profiles", () => {
+  async function lobby() {
+    const s = session();
+    await doFetch(s.obj, "create", { code: "ABC234", hostName: "Sam" });
+    const hostId = (s.state.storage.map.get("meta") as any).hostId;
+    const host = await connect(s, hostId, "Sam", true);
+    const guest = await connect(s, "GUEST00001", "Alex");
+    for (const w of [host, guest]) w.sent.length = 0;
+    return { ...s, host, guest, hostId };
+  }
+
+  /**
+   * ⚠️ **The payload goes to the HOST ONLY.** A taste vector plus up to 5000 watched ids is
+   * the most revealing thing the app holds, and only the host computes the deck — handing
+   * every guest a copy of everyone else's would be a far bigger disclosure than the feature
+   * needs. This assertion is the privacy property; do not relax it to "broadcast" for
+   * convenience.
+   */
+  it("delivers a profile to the host and only the host", async () => {
+    const g = await lobby();
+    await send(g.obj, g.guest, { t: "profile", profile: '{"displayName":"Alex"}' });
+
+    expect(g.host.of("profile")[0]).toMatchObject({ id: "GUEST00001" });
+    expect(g.guest.of("profile")).toHaveLength(0);
+  });
+
+  /** Everyone learns THAT a profile arrived, so a lobby can show who is ready. */
+  it("tells everyone who is ready, without the payload", async () => {
+    const g = await lobby();
+    await send(g.obj, g.guest, { t: "profile", profile: '{"displayName":"Alex"}' });
+
+    const ready = g.host.of("ready")[0];
+    expect(ready.id).toBe("GUEST00001");
+    expect(ready.profile).toBeUndefined();
+    expect(g.guest.of("ready")).toHaveLength(1);
+  });
+
+  /**
+   * ⚠️ Replayed on welcome, not only pushed on arrival. A host that reconnects mid-lobby
+   * would otherwise have lost every profile sent while it was away, and would blend a deck
+   * from its own taste alone with nothing looking wrong.
+   */
+  it("replays collected profiles to a host that reconnects", async () => {
+    const g = await lobby();
+    await send(g.obj, g.guest, { t: "profile", profile: '{"displayName":"Alex"}' });
+
+    // A fresh socket for the same seat is what a reconnect looks like.
+    const back = await connect(g, g.hostId, "Sam", true);
+    const welcome = { ...(await (g.obj as any).collectedProfiles()) };
+    expect(welcome["GUEST00001"]).toBe('{"displayName":"Alex"}');
+    expect(back).toBeTruthy();
+  });
+
+  it("refuses a profile once the deck is set", async () => {
+    const g = await lobby();
+    await send(g.obj, g.host, { t: "start", deck: [603] });
+    await send(g.obj, g.guest, { t: "profile", profile: '{"displayName":"Alex"}' });
+    expect(g.guest.of("error").some((e) => e.message === "already_started")).toBe(true);
+  });
+
+  /** An abuse ceiling, not a working size — a real profile is ~15 KB. */
+  it("refuses an oversized profile", async () => {
+    const g = await lobby();
+    await send(g.obj, g.guest, { t: "profile", profile: "x".repeat(96 * 1024 + 1) });
+    expect(g.guest.of("error")[0].message).toBe("profile_too_large");
+  });
+
+  it("refuses a profile that is not a string", async () => {
+    const g = await lobby();
+    await send(g.obj, g.guest, { t: "profile", profile: { displayName: "Alex" } });
+    expect(g.guest.of("error")[0].message).toBe("bad_profile");
+  });
+
+  /** Everything dies with the session — profiles included. */
+  it("erases profiles when the session ends", async () => {
+    const g = await lobby();
+    await send(g.obj, g.guest, { t: "profile", profile: '{"displayName":"Alex"}' });
+    expect(g.state.storage.map.has("pf:GUEST00001")).toBe(true);
+
+    await send(g.obj, g.host, { t: "end" });
+    expect(g.state.storage.map.size).toBe(0);
+  });
+});
+
 describe("group watch — voting and matching", () => {
   async function swiping(names: string[] = ["Sam", "Alex"]) {
     const s = session();

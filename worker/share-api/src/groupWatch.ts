@@ -80,6 +80,17 @@ export const MAX_PARTICIPANTS = 5;
 export const IDLE_MS = 2 * 60 * 60 * 1000;
 
 const MAX_NAME_LENGTH = 24;
+
+/**
+ * Cap on one participant's taste payload.
+ *
+ * ⚠️ A real `PartnerProfile` is ~15 KB (`WATCHED_SHARE_LIMIT` is 5000 tmdbIds), so this is
+ * an abuse ceiling, not a working size — the same reasoning as `matchAdhoc.ts`'s
+ * `MAX_HALF_BYTES`. It is deliberately well under Durable Object storage's 128 KiB
+ * per-value limit: a payload that squeezed past this check would then fail the `put`, and a
+ * write that throws mid-session is far harder to diagnose than a refusal at the door.
+ */
+const MAX_PROFILE_BYTES = 96 * 1024;
 const MAX_DECK = 500;
 const DEFAULT_SESSIONS_PER_HOUR = 20;
 
@@ -258,6 +269,7 @@ export class GroupSession implements DurableObject {
     await this.touch(m);
 
     const roster = await this.participants();
+    const collected = await this.collectedProfiles();
     this.send(server, {
       t: "welcome",
       you: participant,
@@ -265,6 +277,13 @@ export class GroupSession implements DurableObject {
       participants: roster,
       deck: m.state === "swiping" ? m.deck : undefined,
       maxParticipants: MAX_PARTICIPANTS,
+      // Who has submitted a taste profile, so a lobby can show readiness.
+      ready: Object.keys(collected),
+      // ⚠️ The payloads themselves go to the HOST only, and are REPLAYED here rather than
+      // only pushed on arrival — a host that reconnects mid-lobby would otherwise have lost
+      // every profile sent while it was away, and would blend a deck from its own taste
+      // alone without anything looking wrong.
+      profiles: participant.isHost ? collected : undefined,
     });
     if (!existing) this.broadcast({ t: "joined", participant }, participant.id);
 
@@ -278,7 +297,7 @@ export class GroupSession implements DurableObject {
     const att = ws.deserializeAttachment() as SocketAttachment | null;
     if (!att) return;
 
-    let msg: { t?: string; tmdbId?: unknown; liked?: unknown; deck?: unknown };
+    let msg: { t?: string; tmdbId?: unknown; liked?: unknown; deck?: unknown; profile?: unknown };
     try {
       msg = JSON.parse(raw);
     } catch {
@@ -291,6 +310,8 @@ export class GroupSession implements DurableObject {
     switch (msg.t) {
       case "start":
         return this.onStart(ws, att, m, msg.deck);
+      case "profile":
+        return this.onProfile(ws, att, m, msg.profile);
       case "vote":
         return this.onVote(ws, att, m, msg.tmdbId, msg.liked);
       case "end":
@@ -334,6 +355,68 @@ export class GroupSession implements DurableObject {
     m.state = "swiping";
     await this.touch(m);
     this.broadcast({ t: "deck", items: ids, state: "swiping" });
+  }
+
+  /**
+   * A participant's taste snapshot, so the host can blend a deck everyone is scored against.
+   *
+   * ⚠️ **Sent to the HOST only, never broadcast.** Only the host computes the deck, and a
+   * taste vector plus up to 5000 watched ids is the most revealing thing the app holds —
+   * handing every guest a copy of everyone else's would be a far bigger disclosure than the
+   * feature needs. Everyone else is told only THAT a profile arrived, so a lobby can show
+   * who is ready.
+   *
+   * ⚠️ Stored as the raw JSON string, not parsed. This object has no opinion about the
+   * shape — `PartnerProfile` is versioned and owned by the app — and parsing it here would
+   * make the Worker a second place that must be updated when a field is added.
+   *
+   * ⚠️ Accepted in the LOBBY only. After `start` the deck is fixed, so a late profile could
+   * not affect it, and silently keeping one would imply otherwise.
+   */
+  private async onProfile(
+    ws: WebSocket,
+    att: SocketAttachment,
+    m: SessionMeta,
+    profile: unknown,
+  ): Promise<void> {
+    if (m.state !== "lobby") return this.send(ws, { t: "error", message: "already_started" });
+    if (typeof profile !== "string" || profile.length === 0) {
+      return this.send(ws, { t: "error", message: "bad_profile" });
+    }
+    if (profile.length > MAX_PROFILE_BYTES) {
+      return this.send(ws, { t: "error", message: "profile_too_large" });
+    }
+
+    await this.ctx.storage.put(`pf:${att.participantId}`, profile);
+    await this.touch(m);
+
+    this.sendToHost(m, { t: "profile", id: att.participantId, profile });
+    this.broadcast({ t: "ready", id: att.participantId });
+  }
+
+  /**
+   * Deliver to whichever socket holds the host's seat.
+   *
+   * ⚠️ Silently does nothing when the host is not connected. That is correct rather than an
+   * error: profiles are also replayed to the host on `welcome`, so one that arrives while
+   * they are reconnecting is not lost.
+   */
+  private sendToHost(m: SessionMeta, payload: unknown): void {
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as SocketAttachment | null;
+      if (att?.participantId === m.hostId) {
+        this.send(ws, payload);
+        return;
+      }
+    }
+  }
+
+  /** Every profile collected so far, as `{ participantId: rawJson }`. */
+  private async collectedProfiles(): Promise<Record<string, string>> {
+    const map = await this.ctx.storage.list<string>({ prefix: "pf:" });
+    const out: Record<string, string> = {};
+    for (const [k, v] of map) out[k.slice(3)] = v;
+    return out;
   }
 
   private async onVote(
