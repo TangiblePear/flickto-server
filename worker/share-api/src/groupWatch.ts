@@ -35,6 +35,22 @@
 // identity, so there is nothing to block. The mitigations are structural and are the reason
 // for the caps below: a host-held code, a hard participant limit, no free text anywhere in
 // the protocol, and a session that deletes itself.
+//
+// ## The face-off: from "what we agreed on" to "what we are watching"
+//
+// A results screen with ten matches is not a decision. The host can start a face-off: the
+// matches are seeded into head-to-head pairs (best group fit against worst), everyone picks
+// one poster per pair in private, and a round reveals when the whole room has picked — or
+// when the host calls it. Majority takes a pair; a tie is a coin the SERVER flips, so every
+// screen lands on the same side. Rounds repeat until one title stands, and the session
+// returns to "results" carrying a podium: the winner, then the rest by how far they got.
+//
+// ⚠️ The podium ranks TITLES. Nothing here scores a person, and no client may render it
+// as if it did.
+//
+// ⚠️ Picks are broadcast as counts, never choices, until the round resolves. A client that
+// predates the face-off ignores the frames and stays on its results screen, so a room with
+// one old client relies on the host calling each round.
 
 /** Live state lives here, keyed inside one Durable Object per session. */
 export interface GroupWatchEnv {
@@ -92,14 +108,109 @@ const MAX_NAME_LENGTH = 24;
  */
 const MAX_PROFILE_BYTES = 96 * 1024;
 const MAX_DECK = 500;
+
+/**
+ * Reason caps.
+ *
+ * ⚠️ The whole session lives in ONE Durable Object value with a 128 KiB ceiling, and a deck
+ * can be 500 titles. Unbounded reason text is the one field here that could push a session
+ * past a limit it cannot recover from, so it is clamped at the door.
+ */
+const MAX_REASONS_PER_CARD = 3;
+const MAX_REASON_LENGTH = 140;
 const DEFAULT_SESSIONS_PER_HOUR = 20;
+
+/**
+ * Face-off pool caps.
+ *
+ * Sixteen matches is four rounds, which is as long as a "quick decision" can honestly be.
+ * The near-miss fallback mirrors the results screen's own list (the KMP `NEAR_MISS_LIMIT`):
+ * the face-off must be among titles the room has already seen on that screen.
+ */
+export const FACEOFF_MAX_POOL = 16;
+const FACEOFF_NEAR_MISS_LIMIT = 5;
 
 /**
  * ⚠️ "results" is a LIVE state, not an ending. Everyone is still connected and looking at
  * what they agreed on; the session only becomes "ended" when the host closes it or the alarm
  * fires. Collapsing the two would mean the only way to see the result was to destroy it.
  */
-type SessionState = "lobby" | "swiping" | "results" | "ended";
+/**
+ * "faceoff" is the other live state: the room is whittling its matches down to one, in
+ * head-to-head rounds. It always returns to "results" — with [SessionMeta.podium] set — so a
+ * reconnect, and a client that predates the face-off, still land on a results screen.
+ */
+type SessionState = "lobby" | "swiping" | "results" | "faceoff" | "ended";
+
+/**
+ * What a deck entry is, so a client knows which endpoint resolves it.
+ *
+ * ⚠️ Lower-case on the wire on purpose — it is matched literally by three clients
+ * (KMP, browser, and the share-link preview), and a case-insensitive compare in any one of
+ * them would be a bug the other two never see.
+ */
+type MediaKind = "movie" | "tv";
+
+const MEDIA_KINDS: readonly string[] = ["movie", "tv"];
+
+/**
+ * What the host chose to build the deck from, so the ROOM can see it before it commits.
+ *
+ * ⚠️ **The server does not act on any of this** — it never builds a deck, it only carries
+ * one. This travels so a guest is not asked to swipe thirty cards without being told whether
+ * they are films or shows. Treat it as display copy with structure, not as configuration.
+ *
+ * ⚠️ Every field optional and unvalidated beyond its type: a client that sends a filter this
+ * deploy has never heard of must not have its session refused over a caption.
+ */
+interface DeckFilters {
+  media?: "movies" | "shows" | "both";
+  minRating?: number;
+  yearFrom?: number;
+  maxRuntime?: number;
+  deckLimit?: number;
+}
+
+const MEDIA_CHOICES: readonly string[] = ["movies", "shows", "both"];
+
+/**
+ * Reasons, clamped and aligned, or undefined.
+ *
+ * ⚠️ Returns undefined unless there is EXACTLY one entry per surviving deck id. Partial
+ * alignment is the dangerous case: it looks fine and attributes the wrong reasons.
+ */
+function sanitizeReasons(raw: unknown, deckLength: number, keptLength: number): string[][] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  if (raw.length !== deckLength || keptLength !== deckLength) return undefined;
+  return raw.map((entry) =>
+    (Array.isArray(entry) ? entry : [])
+      .filter((r): r is string => typeof r === "string" && r.trim().length > 0)
+      .slice(0, MAX_REASONS_PER_CARD)
+      .map((r) => r.slice(0, MAX_REASON_LENGTH)),
+  );
+}
+
+/** Clamp to what a caption can honestly say; drop anything malformed rather than echo it. */
+function sanitizeFilters(raw: unknown): DeckFilters | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const r = raw as Record<string, unknown>;
+  const num = (v: unknown, lo: number, hi: number): number | undefined =>
+    typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi ? Math.round(v) : undefined;
+  const out: DeckFilters = {
+    media:
+      typeof r.media === "string" && MEDIA_CHOICES.includes(r.media)
+        ? (r.media as DeckFilters["media"])
+        : undefined,
+    minRating:
+      typeof r.minRating === "number" && Number.isFinite(r.minRating) && r.minRating > 0 && r.minRating <= 10
+        ? Math.round(r.minRating * 10) / 10
+        : undefined,
+    yearFrom: num(r.yearFrom, 1870, 2200),
+    maxRuntime: num(r.maxRuntime, 1, 1000),
+    deckLimit: num(r.deckLimit, 1, MAX_DECK),
+  };
+  return Object.values(out).some((v) => v !== undefined) ? out : undefined;
+}
 
 interface SessionMeta {
   code: string;
@@ -122,12 +233,69 @@ interface SessionMeta {
    */
   scores?: number[];
   /**
+   * Media kind per [deck] entry, same order and length: "movie" or "tv".
+   *
+   * ⚠️ **Absent means MOVIE, and it has to.** The deck predates this field, so every
+   * session created by an older host — and every client that never learned to send it — is
+   * a movie deck by definition. Reading absence as "unknown" would break the one thing the
+   * bare-id deck relies on: that a client can resolve an id without asking anyone.
+   *
+   * ⚠️ Mismatched length reads as absent, exactly as [scores] does. A misaligned type
+   * is worse than none — it resolves a film's id against the show endpoint and renders
+   * whatever unrelated title shares that number.
+   */
+  types?: MediaKind[];
+  /**
+   * Why the scorer picked each deck entry, parallel to [deck]: up to three short lines each.
+   *
+   * ⚠️ Same length-guard as [scores] and [types] — a reason list that slipped a slot would
+   * explain one film using another film's reasons, which is worse than explaining nothing.
+   *
+   * ⚠️ English, and the app renders it verbatim. The scorer's localizable reason CODES are
+   * deliberately not carried: the browser has no reason vocabulary, so codes would double the
+   * payload to serve one of the two clients.
+   */
+  reasons?: string[][];
+  /** The host's pre-swipe choices, for display. See [DeckFilters]. */
+  filters?: DeckFilters;
+  /**
    * Host has closed the room. New seats are refused; existing ones still reconnect.
    *
    * ⚠️ Optional so a session created by an older deploy reads as unlocked rather than
    * `undefined` — which would be falsy anyway, but says so on purpose.
    */
   locked?: boolean;
+  /** The round in progress. Present only while [state] is "faceoff". */
+  faceoff?: Faceoff;
+  /**
+   * How the face-off ranked the TITLES, winner first: then by the round each was knocked
+   * out in (later is higher), deck order breaking ties. Set once, when the last round
+   * resolves, and never cleared — it is what the results screen shows from then on.
+   *
+   * ⚠️ Titles, never people. Nothing in the face-off scores a participant; a person's
+   * picks only decide which poster advances.
+   */
+  podium?: number[];
+}
+
+/**
+ * One round of the face-off.
+ *
+ * ⚠️ Only the CURRENT round is stored. A reveal is a broadcast moment, not state — a
+ * reconnect gets the round in progress and nothing before it. [out] is the one thing that
+ * carries across rounds, because the podium needs to know when each title fell.
+ */
+interface Faceoff {
+  /** 1-based. A pick must name it, so a frame from a round already resolved is refused. */
+  round: number;
+  /** This round's head-to-heads, as tmdb ids. */
+  pairs: [number, number][];
+  /** Advance without a vote this round — the odd one out of a seeding. */
+  byes: number[];
+  /** Participant id → the tmdb id chosen per pair index. Holes are pairs not yet picked. */
+  picks: Record<string, number[]>;
+  /** tmdb id → the round it was eliminated in. */
+  out: Record<string, number>;
 }
 
 interface Participant {
@@ -307,16 +475,27 @@ export class GroupSession implements DurableObject {
 
     const roster = await this.participants();
     const collected = await this.collectedProfiles();
+    // ⚠️ Also in "results" AND "faceoff": a participant reconnecting after the finish still
+    // needs the deck to render what everyone agreed on, or their results screen is a list of
+    // bare numbers — and a face-off is a results screen that has not finished deciding.
+    const decked = m.state === "swiping" || m.state === "results" || m.state === "faceoff";
     this.send(server, {
       t: "welcome",
       you: participant,
       state: m.state,
       participants: roster,
-      // ⚠️ Also in "results": a participant reconnecting after the finish still needs the deck
-      // to render what everyone agreed on, or their results screen is a list of bare numbers.
-      deck: m.state === "swiping" || m.state === "results" ? m.deck : undefined,
-      scores: m.state === "swiping" || m.state === "results" ? m.scores : undefined,
-      results: m.state === "results" ? await this.tally(m) : undefined,
+      deck: decked ? m.deck : undefined,
+      scores: decked ? m.scores : undefined,
+      types: decked ? m.types : undefined,
+      // ⚠️ Sent in EVERY state, unlike the deck: its whole job is to be visible in the lobby,
+      // before there is a deck to describe.
+      reasons: decked ? m.reasons : undefined,
+      filters: m.filters,
+      // ⚠️ The tally travels during a face-off too. A client that predates the face-off
+      // ignores the frames it does not know and must still land on ITS results screen.
+      results: m.state === "results" || m.state === "faceoff" ? await this.tally(m) : undefined,
+      faceoff: m.faceoff ? this.faceoffView(m.faceoff) : undefined,
+      podium: m.podium,
       maxParticipants: MAX_PARTICIPANTS,
       // Who has submitted a taste profile, so a lobby can show readiness.
       ready: Object.keys(collected),
@@ -344,9 +523,14 @@ export class GroupSession implements DurableObject {
       liked?: unknown;
       deck?: unknown;
       scores?: unknown;
+      types?: unknown;
+      filters?: unknown;
+      reasons?: unknown;
       profile?: unknown;
       locked?: unknown;
       id?: unknown;
+      round?: unknown;
+      pair?: unknown;
     };
     try {
       msg = JSON.parse(raw);
@@ -359,19 +543,27 @@ export class GroupSession implements DurableObject {
 
     switch (msg.t) {
       case "start":
-        return this.onStart(ws, att, m, msg.deck, msg.scores);
+        return this.onStart(ws, att, m, msg.deck, msg.scores, msg.types, msg.reasons);
       case "finish":
         return this.onFinish(ws, att, m);
       case "profile":
         return this.onProfile(ws, att, m, msg.profile);
       case "vote":
         return this.onVote(ws, att, m, msg.tmdbId, msg.liked);
+      case "filters":
+        return this.onFilters(ws, att, m, msg.filters);
       case "lock":
         return this.onLock(ws, att, m, msg.locked);
       case "kick":
         return this.onKick(ws, att, m, msg.id);
       case "end":
         return this.onEnd(att, m);
+      case "faceoff":
+        return this.onFaceoff(ws, att, m);
+      case "pick":
+        return this.onPick(ws, att, m, msg.round, msg.pair, msg.tmdbId);
+      case "call":
+        return this.onCall(ws, att, m);
       default:
         return this.send(ws, { t: "error", message: "unknown_message" });
     }
@@ -379,7 +571,12 @@ export class GroupSession implements DurableObject {
 
   async webSocketClose(ws: WebSocket): Promise<void> {
     const att = ws.deserializeAttachment() as SocketAttachment | null;
-    if (att) this.broadcast({ t: "left", id: att.participantId });
+    if (!att) return;
+    this.broadcast({ t: "left", id: att.participantId });
+    // ⚠️ The leaver may have been the one pick the round was waiting on. The same rule as
+    // [checkMatch]: someone who closed their tab must not hold the room hostage.
+    const m = await this.meta();
+    if (m?.state === "faceoff") await this.maybeResolveRound(m, ws);
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {
@@ -399,6 +596,8 @@ export class GroupSession implements DurableObject {
     m: SessionMeta,
     deck: unknown,
     scores: unknown,
+    types: unknown,
+    reasons: unknown,
   ): Promise<void> {
     if (att.participantId !== m.hostId) return this.send(ws, { t: "error", message: "not_host" });
     if (m.state !== "lobby") return this.send(ws, { t: "error", message: "already_started" });
@@ -417,11 +616,34 @@ export class GroupSession implements DurableObject {
         ? raw.map((n) => (Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n as number))) : 0))
         : undefined;
 
+    // ⚠️ Same parallel-array guard as `fit` above, and for a sharper reason: a score that
+    // slips a slot mislabels a match, a TYPE that slips a slot resolves the wrong title
+    // entirely. Anything but a clean one-per-id list is dropped, and the deck falls back to
+    // all-movies — which is what every client already assumes.
+    const rawTypes = Array.isArray(types) ? types : [];
+    const kinds =
+      rawTypes.length === (Array.isArray(deck) ? deck.length : -1) &&
+      ids.length === rawTypes.length &&
+      rawTypes.every((k) => typeof k === "string" && MEDIA_KINDS.includes(k))
+        ? (rawTypes as MediaKind[])
+        : undefined;
+
+    const why = sanitizeReasons(reasons, Array.isArray(deck) ? deck.length : -1, ids.length);
+
     m.deck = ids;
     m.scores = fit;
+    m.types = kinds;
+    m.reasons = why;
     m.state = "swiping";
     await this.touch(m);
-    this.broadcast({ t: "deck", items: ids, scores: fit, state: "swiping" });
+    this.broadcast({
+      t: "deck",
+      items: ids,
+      scores: fit,
+      types: kinds,
+      reasons: why,
+      state: "swiping",
+    });
   }
 
   /**
@@ -622,6 +844,25 @@ export class GroupSession implements DurableObject {
    * participant in the session — to defend against a case that a single tap already closes.
    * The cheaper mechanism covers the same ground, so it is the one that ships.
    */
+  /**
+   * Host announces what the deck will be built from.
+   *
+   * ⚠️ Lobby only. After the start the deck exists and describes itself; a caption that could
+   * still change would be a caption that disagrees with the cards underneath it.
+   */
+  private async onFilters(
+    ws: WebSocket,
+    att: SocketAttachment,
+    m: SessionMeta,
+    raw: unknown,
+  ): Promise<void> {
+    if (att.participantId !== m.hostId) return this.send(ws, { t: "error", message: "not_host" });
+    if (m.state !== "lobby") return this.send(ws, { t: "error", message: "already_started" });
+    m.filters = sanitizeFilters(raw);
+    await this.touch(m);
+    this.broadcast({ t: "filters", filters: m.filters });
+  }
+
   private async onLock(
     ws: WebSocket,
     att: SocketAttachment,
@@ -685,6 +926,182 @@ export class GroupSession implements DurableObject {
     await this.shutdown("host_ended");
   }
 
+  // ── Face-off: whittling the matches down to one ──
+
+  /**
+   * What a client needs to render the round in progress.
+   *
+   * ⚠️ Picks travel as COUNTS only. Who chose what is revealed with the round and never
+   * before, so a late picker cannot be swayed by the room — the same blind rule the deck
+   * keeps client-side with `verdictsFor`, enforced here on the wire instead.
+   */
+  private faceoffView(f: Faceoff): {
+    round: number;
+    pairs: [number, number][];
+    byes: number[];
+    picked: Record<string, number>;
+  } {
+    const picked: Record<string, number> = {};
+    for (const [id, picks] of Object.entries(f.picks)) picked[id] = this.pickCount(picks);
+    return { round: f.round, pairs: f.pairs, byes: f.byes, picked };
+  }
+
+  /** Holes are pairs not yet picked, and a hole reads as undefined or null depending on the trip it took. */
+  private pickCount(picks: number[]): number {
+    let n = 0;
+    for (const p of picks) if (p != null) n++;
+    return n;
+  }
+
+  private inDeckOrder(m: SessionMeta, ids: number[]): number[] {
+    return [...ids].sort((a, b) => m.deck.indexOf(a) - m.deck.indexOf(b));
+  }
+
+  /**
+   * The titles a face-off decides between: the matches, or the near-misses when there were
+   * none.
+   *
+   * ⚠️ The near-miss rule mirrors the results screen — liked by MORE than one, best-liked
+   * first, five at most — because the face-off must be among titles the room has already
+   * seen on that screen. A single match is not a pool: it is already the answer.
+   */
+  private async faceoffPool(m: SessionMeta): Promise<number[]> {
+    const { matches, liked } = await this.tally(m);
+    if (matches.length >= 2) return this.inDeckOrder(m, matches).slice(0, FACEOFF_MAX_POOL);
+    if (matches.length === 1) return matches;
+    return Object.entries(liked)
+      .filter(([, n]) => n > 1)
+      .sort(([a, x], [b, y]) => y - x || m.deck.indexOf(Number(a)) - m.deck.indexOf(Number(b)))
+      .slice(0, FACEOFF_NEAR_MISS_LIMIT)
+      .map(([id]) => Number(id));
+  }
+
+  /**
+   * Seed a round: best group fit against worst, second against second-worst, and so on.
+   * The deck IS the ranking, so deck order is the seeding. An odd pool leaves its middle
+   * title a bye.
+   */
+  private seedPairs(m: SessionMeta, pool: number[]): { pairs: [number, number][]; byes: number[] } {
+    const ordered = this.inDeckOrder(m, pool);
+    const pairs: [number, number][] = [];
+    let lo = 0;
+    let hi = ordered.length - 1;
+    while (lo < hi) {
+      pairs.push([ordered[lo], ordered[hi]]);
+      lo++;
+      hi--;
+    }
+    return { pairs, byes: lo === hi ? [ordered[lo]] : [] };
+  }
+
+  private async onFaceoff(ws: WebSocket, att: SocketAttachment, m: SessionMeta): Promise<void> {
+    if (att.participantId !== m.hostId) return this.send(ws, { t: "error", message: "not_host" });
+    if (m.state !== "results" || m.podium) return this.send(ws, { t: "error", message: "not_decidable" });
+    const pool = await this.faceoffPool(m);
+    if (pool.length < 2) return this.send(ws, { t: "error", message: "nothing_to_decide" });
+
+    m.faceoff = { round: 1, ...this.seedPairs(m, pool), picks: {}, out: {} };
+    m.state = "faceoff";
+    await this.touch(m);
+    this.broadcast({ t: "faceoff", ...this.faceoffView(m.faceoff) });
+  }
+
+  private async onPick(
+    ws: WebSocket,
+    att: SocketAttachment,
+    m: SessionMeta,
+    roundRaw: unknown,
+    pairRaw: unknown,
+    tmdbIdRaw: unknown,
+  ): Promise<void> {
+    const f = m.faceoff;
+    if (m.state !== "faceoff" || !f) return this.send(ws, { t: "error", message: "not_deciding" });
+    if (Number(roundRaw) !== f.round) return this.send(ws, { t: "error", message: "stale_round" });
+    const pair = Number(pairRaw);
+    const tmdbId = Number(tmdbIdRaw);
+    const heads = Number.isInteger(pair) ? f.pairs[pair] : undefined;
+    // Refusing a title outside the pair is what stops a client inventing a winner.
+    if (!heads || !heads.includes(tmdbId)) return this.send(ws, { t: "error", message: "not_in_pair" });
+
+    const mine = f.picks[att.participantId] ?? [];
+    mine[pair] = tmdbId;
+    f.picks[att.participantId] = mine;
+    await this.touch(m);
+    this.broadcast({ t: "picked", id: att.participantId, round: f.round, count: this.pickCount(mine) });
+    await this.maybeResolveRound(m);
+  }
+
+  private async onCall(ws: WebSocket, att: SocketAttachment, m: SessionMeta): Promise<void> {
+    if (att.participantId !== m.hostId) return this.send(ws, { t: "error", message: "not_host" });
+    if (m.state !== "faceoff" || !m.faceoff) return this.send(ws, { t: "error", message: "not_deciding" });
+    await this.resolveRound(m);
+  }
+
+  /**
+   * Everyone connected has picked every pair, so there is nothing left to wait for.
+   *
+   * ⚠️ Connected only, matching [maybeAutoFinish] — and [closing] is the socket on its way
+   * out when this runs from `webSocketClose`, which the runtime may still list.
+   */
+  private async maybeResolveRound(m: SessionMeta, closing?: WebSocket): Promise<void> {
+    const f = m.faceoff;
+    if (m.state !== "faceoff" || !f) return;
+    const connected = this.connectedParticipantIds(closing);
+    if (connected.length === 0) return;
+    for (const id of connected) {
+      if (this.pickCount(f.picks[id] ?? []) < f.pairs.length) return;
+    }
+    await this.resolveRound(m);
+  }
+
+  /**
+   * Settle every pair, then either seed the next round or crown the podium.
+   *
+   * A pair goes to whichever side more people chose. Equal — including nobody at all, when
+   * the host called it early — is a coin the server flips, so every screen lands on the
+   * same side. Byes and winners go forward together, in deck order, so the seeding stays
+   * honest. One survivor ends it: the podium is that title, then everyone it outlasted by
+   * the round they fell in.
+   */
+  private async resolveRound(m: SessionMeta): Promise<void> {
+    const f = m.faceoff;
+    if (!f) return;
+    const results = f.pairs.map(([a, b], i) => {
+      const picks: Record<string, number> = {};
+      let forA = 0;
+      let forB = 0;
+      for (const [id, mine] of Object.entries(f.picks)) {
+        const p = mine[i];
+        if (p == null) continue;
+        picks[id] = p;
+        if (p === a) forA++;
+        else forB++;
+      }
+      const coin = forA === forB;
+      const winner = coin ? (crypto.getRandomValues(new Uint8Array(1))[0] & 1 ? a : b) : forA > forB ? a : b;
+      f.out[String(winner === a ? b : a)] = f.round;
+      return { pair: [a, b] as [number, number], picks, winner, coin };
+    });
+
+    const survivors = this.inDeckOrder(m, [...f.byes, ...results.map((r) => r.winner)]);
+    if (survivors.length === 1) {
+      const fallen = Object.entries(f.out)
+        .map(([id, round]) => ({ id: Number(id), round }))
+        .sort((x, y) => y.round - x.round || m.deck.indexOf(x.id) - m.deck.indexOf(y.id))
+        .map((x) => x.id);
+      m.podium = [survivors[0], ...fallen];
+      m.state = "results";
+      delete m.faceoff;
+      await this.touch(m);
+      this.broadcast({ t: "round", round: f.round, results, podium: m.podium });
+      return;
+    }
+
+    m.faceoff = { round: f.round + 1, ...this.seedPairs(m, survivors), picks: {}, out: f.out };
+    await this.touch(m);
+    this.broadcast({ t: "round", round: f.round, results, next: this.faceoffView(m.faceoff) });
+  }
+
   async alarm(): Promise<void> {
     const m = await this.meta();
     if (!m) return;
@@ -712,9 +1129,11 @@ export class GroupSession implements DurableObject {
 
   // ── Fan-out ──
 
-  private connectedParticipantIds(): string[] {
+  /** [closing] is a socket on its way out that the runtime may still list; it is not here. */
+  private connectedParticipantIds(closing?: WebSocket): string[] {
     const ids = new Set<string>();
     for (const ws of this.ctx.getWebSockets()) {
+      if (ws === closing) continue;
       const att = ws.deserializeAttachment() as SocketAttachment | null;
       if (att) ids.add(att.participantId);
     }

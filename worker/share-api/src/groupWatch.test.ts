@@ -743,3 +743,396 @@ describe("group watch — scores and results", () => {
     expect(back).toBeTruthy();
   });
 });
+
+describe("group watch — deck media kinds", () => {
+  async function started(deck: number[], types?: unknown) {
+    const s = session();
+    await doFetch(s.obj, "create", { code: "ABC234", hostName: "Sam" });
+    const hostId = (s.state.storage.map.get("meta") as any).hostId;
+    const host = await connect(s, hostId, "Sam", true);
+    const guest = await connect(s, "GUEST00001", "Alex");
+    await send(s.obj, host, { t: "start", deck, types });
+    return { ...s, host, guest, hostId };
+  }
+
+  it("carries a media kind per card", async () => {
+    const g = await started([603, 604], ["movie", "tv"]);
+    expect(g.guest.of("deck")[0].types).toEqual(["movie", "tv"]);
+  });
+
+  /**
+   * ⚠️ Absence is not "unknown", it is MOVIE — every deck built before this field existed is
+   * a movie deck, and every client already resolves a bare id as one.
+   */
+  it("still works with no types at all, and says nothing rather than guessing", async () => {
+    const g = await started([603, 604]);
+    expect(g.guest.of("deck")[0].items).toEqual([603, 604]);
+    expect(g.guest.of("deck")[0].types).toBeUndefined();
+  });
+
+  /**
+   * ⚠️ Worse than a misaligned score: a type that slips a slot resolves a film's id against
+   * the show endpoint and renders whatever unrelated title shares that number.
+   */
+  it("drops types that no longer line up with the deck", async () => {
+    const g = await started([603, -1, 604], ["movie", "tv", "tv"]);
+    expect(g.guest.of("deck")[0].items).toEqual([603, 604]);
+    expect(g.guest.of("deck")[0].types).toBeUndefined();
+  });
+
+  it("drops a type array of the wrong length", async () => {
+    const g = await started([603, 604], ["movie"]);
+    expect(g.guest.of("deck")[0].types).toBeUndefined();
+  });
+
+  it("drops the whole array when any entry is not a known kind", async () => {
+    const g = await started([603, 604], ["movie", "episode"]);
+    expect(g.guest.of("deck")[0].types).toBeUndefined();
+  });
+
+  it("drops a type array that is not an array", async () => {
+    const g = await started([603, 604], "movie");
+    expect(g.guest.of("deck")[0].types).toBeUndefined();
+  });
+
+  it("keeps the kinds on the session, for a mid-deck reconnect to be handed", async () => {
+    const g = await started([603, 604], ["tv", "movie"]);
+    // welcome is sent by socket(), which cannot run outside workerd — assert the state the
+    // reconnect would be handed instead.
+    expect((g.state.storage.map.get("meta") as any).types).toEqual(["tv", "movie"]);
+  });
+});
+
+describe("group watch — deck filters travel for the room to see", () => {
+  async function lobby() {
+    const s = session();
+    await doFetch(s.obj, "create", { code: "ABC234", hostName: "Sam" });
+    const hostId = (s.state.storage.map.get("meta") as any).hostId;
+    const host = await connect(s, hostId, "Sam", true);
+    const guest = await connect(s, "GUEST00001", "Alex");
+    return { ...s, host, guest, hostId };
+  }
+
+  it("broadcasts the host's choices to everyone", async () => {
+    const g = await lobby();
+    await send(g.obj, g.host, { t: "filters", filters: { media: "both", deckLimit: 30 } });
+    expect(g.guest.of("filters")[0].filters).toEqual({ media: "both", deckLimit: 30 });
+  });
+
+  /** ⚠️ A guest re-captioning the room would be telling everyone else a lie about the deck. */
+  it("refuses filters from anyone but the host", async () => {
+    const g = await lobby();
+    await send(g.obj, g.guest, { t: "filters", filters: { media: "shows" } });
+    expect(g.guest.of("error").at(-1).message).toBe("not_host");
+    expect((g.state.storage.map.get("meta") as any).filters).toBeUndefined();
+  });
+
+  /** ⚠️ After the start the deck describes itself; a caption that could still change would
+   *  end up disagreeing with the cards underneath it. */
+  it("refuses filters once the deck exists", async () => {
+    const g = await lobby();
+    await send(g.obj, g.host, { t: "start", deck: [603, 604] });
+    await send(g.obj, g.host, { t: "filters", filters: { media: "shows" } });
+    expect(g.host.of("error").at(-1).message).toBe("already_started");
+  });
+
+  it("drops junk rather than echoing it as a caption", async () => {
+    const g = await lobby();
+    await send(g.obj, g.host, {
+      t: "filters",
+      filters: { media: "cartoons", minRating: 99, yearFrom: "soon", deckLimit: -4 },
+    });
+    expect(g.guest.of("filters")[0].filters).toBeUndefined();
+  });
+
+  it("keeps the good fields when only some are junk", async () => {
+    const g = await lobby();
+    await send(g.obj, g.host, { t: "filters", filters: { media: "movies", minRating: 99 } });
+    expect(g.guest.of("filters")[0].filters).toEqual({ media: "movies" });
+  });
+
+  it("survives a filters message that is not an object", async () => {
+    const g = await lobby();
+    await send(g.obj, g.host, { t: "filters", filters: "movies" });
+    expect(g.guest.of("filters")[0].filters).toBeUndefined();
+  });
+});
+
+describe("group watch — why the scorer picked each card", () => {
+  async function started(deck: number[], reasons?: unknown) {
+    const s = session();
+    await doFetch(s.obj, "create", { code: "ABC234", hostName: "Sam" });
+    const hostId = (s.state.storage.map.get("meta") as any).hostId;
+    const host = await connect(s, hostId, "Sam", true);
+    const guest = await connect(s, "GUEST00001", "Alex");
+    await send(s.obj, host, { t: "start", deck, reasons });
+    return { ...s, host, guest, hostId };
+  }
+
+  it("carries a reason list per card", async () => {
+    const g = await started([603, 604], [["Horror is your spine"], ["Three of you watched Nope"]]);
+    expect(g.guest.of("deck")[0].reasons).toEqual([
+      ["Horror is your spine"],
+      ["Three of you watched Nope"],
+    ]);
+  });
+
+  /** ⚠️ Misaligned reasons explain one film using another film's reasons. */
+  it("drops reasons that no longer line up with the deck", async () => {
+    const g = await started([603, -1, 604], [["a"], ["b"], ["c"]]);
+    expect(g.guest.of("deck")[0].items).toEqual([603, 604]);
+    expect(g.guest.of("deck")[0].reasons).toBeUndefined();
+  });
+
+  it("drops a reason array of the wrong length", async () => {
+    const g = await started([603, 604], [["a"]]);
+    expect(g.guest.of("deck")[0].reasons).toBeUndefined();
+  });
+
+  /** ⚠️ One value, 128 KiB, up to 500 cards — unbounded reason text is the real risk here. */
+  it("clamps how many reasons and how long each may be", async () => {
+    const long = "x".repeat(400);
+    const g = await started([603, 604], [["a", "b", "c", "d"], [long]]);
+    const out = g.guest.of("deck")[0].reasons;
+    expect(out[0]).toHaveLength(3);
+    expect(out[1][0]).toHaveLength(140);
+  });
+
+  it("drops blanks rather than rendering an empty line", async () => {
+    const g = await started([603, 604], [["", "   ", "real"], []]);
+    expect(g.guest.of("deck")[0].reasons).toEqual([["real"], []]);
+  });
+
+  it("survives a card whose reasons are not an array", async () => {
+    const g = await started([603, 604], ["nope", ["fine"]]);
+    expect(g.guest.of("deck")[0].reasons).toEqual([[], ["fine"]]);
+  });
+
+  it("keeps them on the session for a mid-deck reconnect", async () => {
+    const g = await started([603, 604], [["a"], ["b"]]);
+    expect((g.state.storage.map.get("meta") as any).reasons).toEqual([["a"], ["b"]]);
+  });
+});
+
+describe("group watch — face-off", () => {
+  /**
+   * A room at its results screen. Everyone likes every id in `agreed` (so those are the
+   * matches, in deck order), and `deck` is the whole deck — a longer deck than `agreed`
+   * leaves the rest unvoted, which is fine: the finish is the host's call.
+   */
+  async function atResults(names: string[], deck: number[], agreed: number[] = deck) {
+    const s = session();
+    await doFetch(s.obj, "create", { code: "ABC234", hostName: names[0] });
+    const hostId = (s.state.storage.map.get("meta") as any).hostId;
+    const sockets = [await connect(s, hostId, names[0], true)];
+    for (let i = 1; i < names.length; i++) {
+      sockets.push(await connect(s, `GUEST0000${i}`, names[i]));
+    }
+    await send(s.obj, sockets[0], { t: "start", deck });
+    for (const id of agreed) for (const ws of sockets) await send(s.obj, ws, { t: "vote", tmdbId: id, liked: true });
+    await send(s.obj, sockets[0], { t: "finish" });
+    for (const ws of sockets) ws.sent.length = 0;
+    return { ...s, sockets, hostId };
+  }
+
+  const meta = (g: { state: FakeState }) => g.state.storage.map.get("meta") as any;
+  const last = (ws: FakeSocket, t: string) => ws.of(t)[ws.of(t).length - 1];
+
+  /** Everyone picks the first head of every pair in the current round. */
+  async function everyonePicksFirst(g: { obj: GroupSession; sockets: FakeSocket[] }, round: any) {
+    for (const ws of g.sockets) {
+      for (let i = 0; i < round.pairs.length; i++) {
+        await send(g.obj, ws, { t: "pick", round: round.round, pair: i, tmdbId: round.pairs[i][0] });
+      }
+    }
+  }
+
+  it("refuses a guest, and a host outside the results", async () => {
+    const g = await atResults(["Sam", "Alex"], [1, 2, 3, 4]);
+    await send(g.obj, g.sockets[1], { t: "faceoff" });
+    expect(g.sockets[1].of("error")[0].message).toBe("not_host");
+
+    const s = session();
+    await doFetch(s.obj, "create", { code: "ABC234", hostName: "Sam" });
+    const ws = await connect(s, (s.state.storage.map.get("meta") as any).hostId, "Sam", true);
+    await send(s.obj, ws, { t: "faceoff" });
+    expect(ws.of("error")[0].message).toBe("not_decidable");
+  });
+
+  /** A single match is already the answer; nothing to whittle. */
+  it("refuses a pool of fewer than two", async () => {
+    const g = await atResults(["Sam", "Alex"], [1, 2, 3], [1]);
+    await send(g.obj, g.sockets[0], { t: "faceoff" });
+    expect(g.sockets[0].of("error")[0].message).toBe("nothing_to_decide");
+  });
+
+  it("seeds best against worst, in deck order, and gives an odd pool a bye", async () => {
+    const g = await atResults(["Sam", "Alex"], [10, 20, 30, 40, 50]);
+    await send(g.obj, g.sockets[0], { t: "faceoff" });
+    const f = g.sockets[1].of("faceoff")[0];
+    expect(f.round).toBe(1);
+    expect(f.pairs).toEqual([
+      [10, 50],
+      [20, 40],
+    ]);
+    expect(f.byes).toEqual([30]);
+    expect(meta(g).state).toBe("faceoff");
+  });
+
+  it("seeds ten into five pairs", async () => {
+    const deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const g = await atResults(["Sam", "Alex"], deck);
+    await send(g.obj, g.sockets[0], { t: "faceoff" });
+    const f = g.sockets[0].of("faceoff")[0];
+    expect(f.pairs).toHaveLength(5);
+    expect(f.byes).toEqual([]);
+  });
+
+  /** ⚠️ The results screen's own near-miss list, so the pool is what the room has seen. */
+  it("falls back to the near-misses when nothing was unanimous", async () => {
+    const g = await atResults(["Sam", "Alex", "Jo"], [1, 2, 3], []);
+    const [a] = g.sockets;
+    // 1 liked by two, 2 liked by two, 3 liked by one: a pool of two. Seeded directly —
+    // the session is past swiping, so a vote frame would be refused.
+    await g.state.storage.put(`v:${g.hostId}`, { "1": true });
+    await g.state.storage.put("v:GUEST00001", { "1": true, "2": true });
+    await g.state.storage.put("v:GUEST00002", { "2": true, "3": true });
+    a.sent.length = 0;
+    await send(g.obj, a, { t: "faceoff" });
+    expect(a.of("faceoff")[0].pairs).toEqual([[1, 2]]);
+  });
+
+  it("refuses a pick outside the pair, and a pick for a round already gone", async () => {
+    const g = await atResults(["Sam", "Alex"], [1, 2]);
+    const [a] = g.sockets;
+    await send(g.obj, a, { t: "faceoff" });
+    await send(g.obj, a, { t: "pick", round: 1, pair: 0, tmdbId: 99 });
+    expect(last(a, "error").message).toBe("not_in_pair");
+    await send(g.obj, a, { t: "pick", round: 2, pair: 0, tmdbId: 1 });
+    expect(last(a, "error").message).toBe("stale_round");
+  });
+
+  /** ⚠️ The blind rule on the wire: counts travel, choices do not. */
+  it("broadcasts a count, never the choice, until the round resolves", async () => {
+    const g = await atResults(["Sam", "Alex"], [1, 2, 3, 4]);
+    const [a, b] = g.sockets;
+    await send(g.obj, a, { t: "faceoff" });
+    await send(g.obj, a, { t: "pick", round: 1, pair: 0, tmdbId: 1 });
+    const p = b.of("picked")[0];
+    expect(p).toEqual({ t: "picked", id: g.hostId, round: 1, count: 1 });
+    expect(JSON.stringify(p)).not.toContain("tmdbId");
+    expect(b.of("round")).toHaveLength(0);
+  });
+
+  it("resolves only when everyone connected has picked every pair", async () => {
+    const g = await atResults(["Sam", "Alex", "Jo"], [1, 2, 3, 4]);
+    const [a, b, c] = g.sockets;
+    await send(g.obj, a, { t: "faceoff" });
+    const f = a.of("faceoff")[0];
+    await everyonePicksFirst({ obj: g.obj, sockets: [a, b] }, f);
+    expect(a.of("round")).toHaveLength(0);
+    await send(g.obj, c, { t: "pick", round: 1, pair: 0, tmdbId: 1 });
+    expect(a.of("round")).toHaveLength(0);
+    await send(g.obj, c, { t: "pick", round: 1, pair: 1, tmdbId: 2 });
+    expect(a.of("round")).toHaveLength(1);
+  });
+
+  it("majority takes a pair; the loser is out in that round", async () => {
+    const g = await atResults(["Sam", "Alex", "Jo"], [1, 2]);
+    const [a, b, c] = g.sockets;
+    await send(g.obj, a, { t: "faceoff" });
+    await send(g.obj, a, { t: "pick", round: 1, pair: 0, tmdbId: 2 });
+    await send(g.obj, b, { t: "pick", round: 1, pair: 0, tmdbId: 2 });
+    await send(g.obj, c, { t: "pick", round: 1, pair: 0, tmdbId: 1 });
+    const r = a.of("round")[0];
+    expect(r.results[0]).toMatchObject({ pair: [1, 2], winner: 2, coin: false });
+    expect(r.results[0].picks).toEqual({ [g.hostId]: 2, GUEST00001: 2, GUEST00002: 1 });
+    expect(r.podium).toEqual([2, 1]);
+  });
+
+  it("flips a coin on a tie and says so", async () => {
+    const g = await atResults(["Sam", "Alex"], [1, 2]);
+    const [a, b] = g.sockets;
+    await send(g.obj, a, { t: "faceoff" });
+    await send(g.obj, a, { t: "pick", round: 1, pair: 0, tmdbId: 1 });
+    await send(g.obj, b, { t: "pick", round: 1, pair: 0, tmdbId: 2 });
+    const r = b.of("round")[0];
+    expect(r.results[0].coin).toBe(true);
+    expect([1, 2]).toContain(r.results[0].winner);
+  });
+
+  /** ⚠️ A pair nobody picked is a tie, not a crash — the host called it early. */
+  it("lets the host call a round with picks missing", async () => {
+    const g = await atResults(["Sam", "Alex"], [1, 2, 3, 4]);
+    const [a, b] = g.sockets;
+    await send(g.obj, a, { t: "faceoff" });
+    await send(g.obj, b, { t: "call" });
+    expect(last(b, "error").message).toBe("not_host");
+    await send(g.obj, a, { t: "pick", round: 1, pair: 0, tmdbId: 4 });
+    await send(g.obj, a, { t: "call" });
+    const r = a.of("round")[0];
+    expect(r.results[0]).toMatchObject({ winner: 4, coin: false });
+    expect(r.results[1].coin).toBe(true);
+    expect(r.next.round).toBe(2);
+    expect(r.next.pairs).toHaveLength(1);
+  });
+
+  /** ⚠️ Someone who closed their tab must not hold the round open. */
+  it("resolves when the last person it was waiting on disconnects", async () => {
+    const g = await atResults(["Sam", "Alex", "Jo"], [1, 2]);
+    const [a, b, c] = g.sockets;
+    await send(g.obj, a, { t: "faceoff" });
+    await send(g.obj, a, { t: "pick", round: 1, pair: 0, tmdbId: 1 });
+    await send(g.obj, b, { t: "pick", round: 1, pair: 0, tmdbId: 1 });
+    expect(a.of("round")).toHaveLength(0);
+    c.close(1000, "gone");
+    await g.obj.webSocketClose(c as any);
+    expect(a.of("round")).toHaveLength(1);
+    expect(a.of("round")[0].podium).toEqual([1, 2]);
+  });
+
+  it("carries byes forward and ranks the podium by how far each title got", async () => {
+    // 5 titles: round 1 pairs (1,5) (2,4), bye 3. Everyone picks the first head.
+    const g = await atResults(["Sam", "Alex"], [1, 2, 3, 4, 5]);
+    const [a] = g.sockets;
+    await send(g.obj, a, { t: "faceoff" });
+    await everyonePicksFirst(g, a.of("faceoff")[0]);
+    let r = last(a, "round");
+    expect(r.next.pairs).toEqual([[1, 3]]);
+    expect(r.next.byes).toEqual([2]);
+
+    // Round 2: 1 beats 3; 2 has the bye.
+    await everyonePicksFirst(g, r.next);
+    r = last(a, "round");
+    expect(r.next.pairs).toEqual([[1, 2]]);
+    expect(r.next.byes).toEqual([]);
+
+    // Final: 1 beats 2.
+    await everyonePicksFirst(g, r.next);
+    r = last(a, "round");
+    expect(r.next).toBeUndefined();
+    // Winner, finalist, the semi-final loser, then round-one losers in deck order.
+    expect(r.podium).toEqual([1, 2, 3, 4, 5]);
+    expect(meta(g).state).toBe("results");
+    expect(meta(g).podium).toEqual([1, 2, 3, 4, 5]);
+    expect(meta(g).faceoff).toBeUndefined();
+  });
+
+  it("refuses a second face-off once there is a podium", async () => {
+    const g = await atResults(["Sam", "Alex"], [1, 2]);
+    const [a] = g.sockets;
+    await send(g.obj, a, { t: "faceoff" });
+    await everyonePicksFirst(g, a.of("faceoff")[0]);
+    await send(g.obj, a, { t: "faceoff" });
+    expect(last(a, "error").message).toBe("not_decidable");
+  });
+
+  it("caps the pool at sixteen, keeping the best group fit", async () => {
+    const deck = Array.from({ length: 20 }, (_, i) => i + 1);
+    const g = await atResults(["Sam", "Alex"], deck);
+    await send(g.obj, g.sockets[0], { t: "faceoff" });
+    const f = g.sockets[0].of("faceoff")[0];
+    expect(f.pairs).toHaveLength(8);
+    expect(f.pairs[0]).toEqual([1, 16]);
+  });
+});
