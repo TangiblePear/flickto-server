@@ -98,6 +98,12 @@ import { reapOrphanProfiles, reapOldReports, dueForReap } from "./reaper";
 import { handleAccountLink, handleAccountResolve, handleAccountUnlink, deleteAccountForFriend } from "./account";
 import { handleAuthSession, handleAuthLogout, handleAuthProbe, resolveSession } from "./auth";
 import { GroupSession, handleWatchCreate, handleWatchMeta, handleWatchSocket } from "./groupWatch";
+import {
+  handleAcceptWatchInvite,
+  handleDeclineWatchInvite,
+  handleGetWatchInvites,
+  handleWatchInvite,
+} from "./watchInvites";
 import { handleClearFeed, handleGetFeed, handlePublishFeed } from "./feed";
 import {
   handleAcceptSharedList,
@@ -647,6 +653,24 @@ export default {
 
     const listTarget = p.match(/^\/api\/lists\/shared\/([0-9A-HJKMNP-TV-Z]{8,40})$/);
     if (listTarget && req.method === "DELETE") return handleDeleteSharedList(listTarget[1], req, env, ctx);
+
+    // ── "Come and choose something with us" — a room code, sent to a friend ──
+    //
+    // ⚠️ Down HERE, with the other directed invites, and not up beside the room routes,
+    // because `wake` is declared in this function and is still in its temporal dead zone up
+    // there. Referencing it earlier is a ReferenceError the catch-all turns into a 500 —
+    // the exact failure the comment above `wake` records.
+    //
+    // The room-code patterns above cannot swallow these: that regex is upper-case only and
+    // "invite" is not.
+    if (p === "/api/watch/invite" && req.method === "POST") return handleWatchInvite(req, env, ctx, wake);
+    if (p === "/api/watch/invites" && req.method === "GET") return handleGetWatchInvites(req, env, ctx);
+
+    const inviteAccept = p.match(/^\/api\/watch\/invites\/([0-9A-HJKMNP-TV-Z]{8,40})\/accept$/);
+    if (inviteAccept && req.method === "POST") return handleAcceptWatchInvite(inviteAccept[1], req, env, ctx);
+
+    const inviteTarget = p.match(/^\/api\/watch\/invites\/([0-9A-HJKMNP-TV-Z]{8,40})$/);
+    if (inviteTarget && req.method === "DELETE") return handleDeclineWatchInvite(inviteTarget[1], req, env, ctx);
 
     // ── Account-free Friend Match, by QR, in person ──
     // Deliberately UNAUTHENTICATED: the whole point is that neither side needs an account.
