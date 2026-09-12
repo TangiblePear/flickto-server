@@ -4,7 +4,7 @@
  * ⚠️ MIRRORS flickto-web/lib/games/flickgrid.ts. Two implementations, one contract, and the
  * failure mode is the one this repo already has a fixture file for: they disagree, the
  * client draws a cell green, the server rejects the pick, and the player's score changes
- * on reload with nothing in any log. docs/game/grid-fixtures.json pins both.
+ * on reload with nothing in any log. Documents and Resources/Tests/game/grid-fixtures.json pins both.
  *
  * The client is the one that must be generous-but-correct at fill time; THIS is the
  * authority, because it is what the stored score is derived from.

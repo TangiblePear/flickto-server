@@ -41,7 +41,7 @@ const FLICKTO_SERVER = resolve(HERE, "../../..");
 const REPO_ROOT = resolve(HERE, "../../../..");
 
 const CATALOG_PATH = process.argv[2] ?? join(REPO_ROOT, "master_catalog.json");
-const FIXTURE_PATH = join(REPO_ROOT, "docs/game/grading-fixtures.json");
+const FIXTURE_PATH = join(REPO_ROOT, "Documents and Resources/Tests/game/grading-fixtures.json");
 const POOL_OUT = join(DAILY_AI, "src/game/pool.ts");
 const TITLES_OUT = join(FLICKTO_SERVER, "content/content/game/titles.v2.json");
 

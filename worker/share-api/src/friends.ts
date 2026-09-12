@@ -263,7 +263,7 @@ export async function handleFriendRequest(
   // `handlePostInbox`. Deleting that send took the wake-up with it, and the request sat
   // in D1, correct and invisible, until the recipient's next scheduled sync — measured
   // on device the same day. The identical mistake was made with shared lists on
-  // 2026-07-27; see the FCM note in `docs/agent-map/android/16-feature-social.md`.
+  // 2026-07-27; see the FCM note in `Documents and Resources/docs/agent-map/android/16-feature-social.md`.
   notify?.(target);
   return json({ state: "pending" });
 }

@@ -19,7 +19,7 @@
  * it as guess #1. That is unfixable while the client grades offline, and it is why
  * ranking is FRIENDS ONLY — forging there moves you up a list of people who know you, so
  * the incentive never really appears. A global leaderboard would supply that incentive
- * and would need server-validated guessing first. See docs/game/grading-fixtures.json.
+ * and would need server-validated guessing first. See Documents and Resources/Tests/game/grading-fixtures.json.
  */
 import { resolveSession } from "./auth";
 import { visiblePictureUrl } from "./premiere";
@@ -57,7 +57,7 @@ export interface DailyGameEnv {
 }
 
 /**
- * MUST match docs/game/grading-fixtures.json and both clients. The clients compute this
+ * MUST match Documents and Resources/Tests/game/grading-fixtures.json and both clients. The clients compute this
  * for display; the value stored is always the one derived here.
  */
 const SCORE_LADDER = [100, 80, 60, 45, 30];
