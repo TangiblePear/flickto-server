@@ -12,7 +12,7 @@ You'll need:
 - **Node.js** ≥ 18 — `node --version` to check
 - **pnpm** — `npm install -g pnpm` if you don't have it
 - **A TMDB API key** — the same one you use in the Flickd app (`local.properties` → `DEFAULT_TMDB_READ_TOKEN`)
-- **Git** configured to push to your `flickd-content` GitHub repo (the launcher commits + pushes on every save)
+- **Git** configured to push to your `flickto-server` GitHub repo (the launcher commits + pushes on every save)
 
 That's it. No other dependencies.
 
@@ -20,7 +20,7 @@ That's it. No other dependencies.
 
 ## 1. Launch the app
 
-Double-click **`start-admin.bat`** in `C:\Users\reser\Workspaces\Media Remote\flickd-content\`.
+Double-click **`start-admin.bat`** in `C:\Users\reser\Workspaces\Media Remote\flickto-server\`.
 
 What happens:
 1. The script `cd`s into `admin/`.
@@ -128,8 +128,8 @@ Sidebar → **Awards** → click the season tile. You're on the edit page with e
 
 If you need to **delete a ceremony**, there's no UI for that. Delete the file:
 ```powershell
-Remove-Item "C:\Users\reser\Workspaces\Media Remote\flickd-content\content\awards\<slug>.json"
-node "C:\Users\reser\Workspaces\Media Remote\flickd-content\scripts\build-manifest.mjs"
+Remove-Item "C:\Users\reser\Workspaces\Media Remote\flickto-server\content\awards\<slug>.json"
+node "C:\Users\reser\Workspaces\Media Remote\flickto-server\scripts\build-manifest.mjs"
 git add content/
 git commit -m "chore: remove <slug>"
 git push

@@ -6,7 +6,7 @@
 
 .NOTES
   Requires: npx wrangler (authenticated)
-  Run from: flickd-content/
+  Run from: flickto-server/
 #>
 
 $BUCKET = "flickto-content"
@@ -94,7 +94,7 @@ Next steps:
   2. Under 'Public Access -> Custom Domains', click 'Connect Domain'
   3. Enter: flickto.app
   4. Deploy the content worker (removes its old routes):
-       cd flickd-content/content && npx wrangler deploy
+       cd flickto-server/content && npx wrangler deploy
   5. Deploy daily-ai (now writes to flickto-content/content/daily/):
-       cd flickd-content/worker/daily-ai && npx wrangler deploy
+       cd flickto-server/worker/daily-ai && npx wrangler deploy
 "@ -ForegroundColor Yellow

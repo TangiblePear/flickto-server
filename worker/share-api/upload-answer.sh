@@ -3,7 +3,7 @@
 # against, so every correct guess comes back `unverified` (HTTP 400) and nothing reaches
 # the leaderboard, the stats or the streak.
 #
-#   cd "C:/Users/reser/Workspaces/Media Remote/flickd-content/worker/share-api"
+#   cd "C:/Users/reser/Workspaces/Media Remote/flickto-server/worker/share-api"
 #   bash upload-answer.sh
 set -euo pipefail
 

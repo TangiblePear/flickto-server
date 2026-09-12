@@ -2351,8 +2351,8 @@ function htmlEscape(s: string): string {
 // Legal / compliance pages (/privacy, /delete) have been moved to static HTML
 // files served by the flickto-content worker. The inline templates that were
 // here (privacyPage(), deletePage(), LEGAL_CSS) have been extracted to:
-//   flickd-content/content/privacy.html
-//   flickd-content/content/delete.html
+//   flickto-server/content/privacy.html
+//   flickto-server/content/delete.html
 
 // ⚠️ Re-exported from the worker entry because that is the only place wrangler looks for a
 // Durable Object class. A binding whose `class_name` is not exported here fails at DEPLOY
